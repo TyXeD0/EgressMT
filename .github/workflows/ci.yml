@@ -3,6 +3,11 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    # Upstream MTProxyL can change without an EgressMT commit. A daily build
+    # gives us an early warning when the panel patch stops applying/building.
+    - cron: '23 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,20 +26,27 @@ jobs:
       - name: Repository safety
         run: bash scripts/repo-safety-check.sh
 
-  panel-build:
+  panel-build-current-upstream:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch pinned MTProxyL source
+      - name: Fetch current MTProxyL source
+        run: git clone --filter=blob:none --depth=1 https://github.com/Liafanx/MTProxyL.git /tmp/MTProxyL
+      - name: Show upstream versions
         run: |
-          git clone --filter=blob:none https://github.com/Liafanx/MTProxyL.git /tmp/MTProxyL
-          git -C /tmp/MTProxyL checkout 8e6ef1d598a2d4f3af2b4a81ac028b0f9ae7afe5
-      - name: Apply EgressMT panel patch
-        run: python3 panel/patch.py /tmp/MTProxyL/mtproxyl-panel panel
-      - name: Build patched panel
+          echo "MTProxyL $(cat /tmp/MTProxyL/version)"
+          sed -nE 's/^[[:space:]]*var version = "([^"]+)".*/Panel \1/p' /tmp/MTProxyL/mtproxyl-panel/main.go
+          git -C /tmp/MTProxyL rev-parse HEAD
+      - name: Apply EgressMT panel patch twice (idempotency)
         run: |
+          python3 panel/patch.py /tmp/MTProxyL/mtproxyl-panel panel
+          python3 panel/patch.py /tmp/MTProxyL/mtproxyl-panel panel
+      - name: Build patched current panel
+        run: |
+          UPSTREAM_VERSION="$(sed -nE 's/^[[:space:]]*var version = "([^"]+)".*/\1/p' /tmp/MTProxyL/mtproxyl-panel/main.go | head -n1)"
+          test -n "$UPSTREAM_VERSION"
           docker build \
             --build-arg TARGETARCH=amd64 \
-            --build-arg VERSION=1.0.14-egressmt-rc1 \
+            --build-arg VERSION="${UPSTREAM_VERSION}-egressmt-ci" \
             -t egressmt-panel-ci \
             /tmp/MTProxyL/mtproxyl-panel
