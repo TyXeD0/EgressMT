@@ -20,7 +20,7 @@ jobs:
       - name: Python syntax
         run: python3 -m py_compile src/*.py panel/*.py
       - name: Shell syntax
-        run: bash -n install.sh lib/*.sh src/*.sh panel/*.sh scripts/*.sh
+        run: bash -n bootstrap.sh install.sh lib/*.sh src/*.sh panel/*.sh scripts/*.sh
       - name: Go syntax
         run: gofmt panel/backend/egress.go >/dev/null
       - name: Repository safety
