@@ -16,19 +16,16 @@ fail(){ echo "ERROR: $*" >&2; exit 1; }
 [[ ${EUID:-$(id -u)} -eq 0 ]] || fail "root required"
 if [[ -r /etc/os-release ]]; then
     . /etc/os-release
-    [[ "${ID:-}" == "ubuntu" ]] || fail "Ubuntu is required for v0.1.0-rc1"
+    [[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] || fail "Ubuntu 24.04 is required for v0.1.0-rc1"
 fi
 
 msg "Проверка зависимостей..." "Checking dependencies..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o DPkg::Lock::Timeout=120 update -y >/dev/null
-apt-get -o DPkg::Lock::Timeout=120 install -y ca-certificates curl gnupg python3 iproute2 iputils-ping nftables openssh-client sshpass dkms "linux-headers-$(uname -r)" >/dev/null
+apt-get -o DPkg::Lock::Timeout=120 install -y \
+    ca-certificates curl gnupg python3 iproute2 iputils-ping nftables \
+    openssh-client sshpass dkms "linux-headers-$(uname -r)" >/dev/null
 
-# Do not use add-apt-repository here. It talks to the Launchpad REST API to
-# obtain the PPA key and may fail even when the actual PPA repository is fine
-# (for example GPGKeyTemporarilyNotFoundError / HTTP 500). EgressMT imports the
-# published PPA signing key directly, verifies its full fingerprint and writes
-# a modern signed-by Deb822 source instead.
 install_amneziawg(){
     command -v awg >/dev/null 2>&1 && command -v awg-quick >/dev/null 2>&1 && return 0
 
@@ -40,11 +37,12 @@ install_amneziawg(){
 
     msg "Устанавливаю AmneziaWG..." "Installing AmneziaWG..."
     curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 \
-        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${fpr}" -o "$armored" \
-        || fail "cannot download Amnezia PPA signing key"
+        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${fpr}" \
+        -o "$armored" || fail "cannot download Amnezia PPA signing key"
 
     got="$(gpg --batch --show-keys --with-colons "$armored" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
     [[ "$got" == "$fpr" ]] || fail "Amnezia PPA signing-key fingerprint mismatch"
+
     install -d -m 755 /usr/share/keyrings
     gpg --batch --yes --dearmor --output "$keyring" "$armored"
     chmod 644 "$keyring"
@@ -58,14 +56,16 @@ Signed-By: $keyring
 EOF
     chmod 644 "$source"
 
-    local ok=0
+    local ok=0 delay
     for delay in 0 3 10; do
         (( delay == 0 )) || sleep "$delay"
-        if apt-get -o DPkg::Lock::Timeout=120 update -y >/dev/null; then
-            if apt-cache show amneziawg-tools >/dev/null 2>&1; then ok=1; break; fi
+        if apt-get -o DPkg::Lock::Timeout=120 update -y >/dev/null \
+            && apt-cache show amneziawg-tools >/dev/null 2>&1; then
+            ok=1
+            break
         fi
     done
-    (( ok == 1 )) || fail "Amnezia PPA is unavailable or does not publish packages for Ubuntu 24.04"
+    (( ok == 1 )) || fail "Amnezia PPA is unavailable or package metadata is missing"
 
     apt-get -o DPkg::Lock::Timeout=120 install -y amneziawg amneziawg-tools >/dev/null \
         || fail "failed to install AmneziaWG packages"
@@ -109,91 +109,14 @@ download(){
     curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors "${RAW}/${path}" -o "$dest"
 }
 
-for f in egressd.py cli.py registry.py provision.py node-agent.py boot-guard.sh; do
+for f in egressd.py cli.py registry.py provision.py provision-wrapper.py node-agent.py boot-guard.sh; do
     download "src/$f" "$TMP/$f"
 done
 download "lib/manage.sh" "$TMP/manage.sh"
 
-# rc1 hotfix: patch the downloaded canonical provisioner before installation so
-# remote EXIT preparation uses the same verified direct-PPA method as ENTRY.
-# This is intentionally exact-match/fail-closed: if provision.py changes, the
-# installer stops instead of silently applying a stale transformation.
-python3 - "$TMP/provision.py" <<'PY'
-from pathlib import Path
-import sys
-p=Path(sys.argv[1])
-s=p.read_text()
-old=r'''def remote_packages(ssh: SSH) -> str:
-    script = r'''set -Eeuo pipefail
-export DEBIAN_FRONTEND=noninteractive
-. /etc/os-release
-[[ "${ID:-}" == "ubuntu" ]] || { echo "unsupported OS" >&2; exit 78; }
-apt-get update -y >/dev/null
-apt-get install -y software-properties-common ca-certificates iproute2 nftables python3 >/dev/null
-if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
-  add-apt-repository -y ppa:amnezia/ppa >/dev/null
-  apt-get update -y >/dev/null
-  apt-get install -y amneziawg amneziawg-tools >/dev/null
-fi
-command -v awg >/dev/null
-command -v awg-quick >/dev/null
-ip -4 route show default | awk 'NR==1{print $5}'
-'''
-    out = ssh.exec(script, timeout=300).splitlines()
-    if not out: fail("cannot detect remote external interface")
-    return out[-1].strip()
-'''
-new=r'''def remote_packages(ssh: SSH) -> str:
-    script = r'''set -Eeuo pipefail
-export DEBIAN_FRONTEND=noninteractive
-. /etc/os-release
-[[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] || { echo "Ubuntu 24.04 is required" >&2; exit 78; }
-APT=(apt-get -o DPkg::Lock::Timeout=120)
-"${APT[@]}" update -y >/dev/null
-"${APT[@]}" install -y ca-certificates curl gnupg iproute2 nftables python3 dkms "linux-headers-$(uname -r)" >/dev/null
-if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
-  FPR="75C9DD72C799870E310542E24166F2C257290828"
-  KEYRING="/usr/share/keyrings/amnezia-archive-keyring.gpg"
-  SOURCE="/etc/apt/sources.list.d/amnezia-ppa.sources"
-  KEY="$(mktemp /tmp/egressmt-amnezia-key.XXXXXX)"
-  trap 'rm -f "$KEY"' EXIT
-  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 \
-    "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${FPR}" -o "$KEY"
-  GOT="$(gpg --batch --show-keys --with-colons "$KEY" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
-  [[ "$GOT" == "$FPR" ]] || { echo "Amnezia PPA signing-key fingerprint mismatch" >&2; exit 74; }
-  install -d -m 755 /usr/share/keyrings
-  gpg --batch --yes --dearmor --output "$KEYRING" "$KEY"
-  chmod 644 "$KEYRING"
-  cat >"$SOURCE" <<EOF
-Types: deb
-URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu
-Suites: noble
-Components: main
-Signed-By: $KEYRING
-EOF
-  chmod 644 "$SOURCE"
-  OK=0
-  for DELAY in 0 3 10; do
-    (( DELAY == 0 )) || sleep "$DELAY"
-    if "${APT[@]}" update -y >/dev/null && apt-cache show amneziawg-tools >/dev/null 2>&1; then OK=1; break; fi
-  done
-  (( OK == 1 )) || { echo "Amnezia PPA unavailable or package metadata missing" >&2; exit 75; }
-  "${APT[@]}" install -y amneziawg amneziawg-tools >/dev/null
-fi
-command -v awg >/dev/null
-command -v awg-quick >/dev/null
-ip -4 route show default | awk 'NR==1{print $5}'
-'''
-    out = ssh.exec(script, timeout=420).splitlines()
-    if not out: fail("cannot detect remote external interface")
-    return out[-1].strip()
-'''
-if old not in s:
-    raise SystemExit("provision.py remote_packages anchor changed; refusing stale hotfix")
-p.write_text(s.replace(old,new,1))
-PY
-
-python3 -m py_compile "$TMP/egressd.py" "$TMP/cli.py" "$TMP/registry.py" "$TMP/provision.py" "$TMP/node-agent.py"
+python3 -m py_compile \
+    "$TMP/egressd.py" "$TMP/cli.py" "$TMP/registry.py" \
+    "$TMP/provision.py" "$TMP/provision-wrapper.py" "$TMP/node-agent.py"
 bash -n "$TMP/boot-guard.sh" "$TMP/manage.sh"
 
 install -d -m 700 "$BACKUP"
@@ -203,6 +126,7 @@ for p in \
     /usr/local/libexec/mtproxyl-egressd \
     /usr/local/libexec/mtproxyl-egress-registry \
     /usr/local/libexec/mtproxyl-egress-provision \
+    /usr/local/libexec/mtproxyl-egress-provision-core.py \
     /usr/local/libexec/mtproxyl-node-agent-source \
     /usr/local/libexec/mtproxyl-egress-boot-guard \
     /usr/local/bin/mtproxyl-egress \
@@ -215,13 +139,16 @@ for p in \
     [[ -e "$p" ]] && cp -a --parents "$p" "$BACKUP/" 2>/dev/null || true
  done
 
-install -d -m 700 /etc/mtproxyl-egress /etc/mtproxyl-egress/nodes.d /etc/mtproxyl-egress/nodes /etc/mtproxyl-egress/ssh
+install -d -m 700 \
+    /etc/mtproxyl-egress /etc/mtproxyl-egress/nodes.d \
+    /etc/mtproxyl-egress/nodes /etc/mtproxyl-egress/ssh
 install -d -m 700 /var/lib/mtproxyl-egress /run/mtproxyl-egress
 install -d -m 755 /usr/local/libexec /usr/local/bin
 
 if [[ ! -f /etc/mtproxyl-egress/config.toml ]]; then
     install -m 755 "$TMP/registry.py" /usr/local/libexec/mtproxyl-egress-registry
-    /usr/local/libexec/mtproxyl-egress-registry init --telemt-config "$TELEMT_CONFIG" --container mtproxyl
+    /usr/local/libexec/mtproxyl-egress-registry init \
+        --telemt-config "$TELEMT_CONFIG" --container mtproxyl
 fi
 
 install -m 755 "$TMP/egressd.py" /usr/local/libexec/mtproxyl-egressd
@@ -229,11 +156,13 @@ install -m 755 "$TMP/cli.py" /usr/local/bin/mtproxyl-egress
 ln -sfn /usr/local/bin/mtproxyl-egress /usr/local/bin/egressmt
 install -m 755 "$TMP/manage.sh" /usr/local/bin/egressmt-menu
 install -m 755 "$TMP/registry.py" /usr/local/libexec/mtproxyl-egress-registry
-install -m 755 "$TMP/provision.py" /usr/local/libexec/mtproxyl-egress-provision
+install -m 644 "$TMP/provision.py" /usr/local/libexec/mtproxyl-egress-provision-core.py
+install -m 755 "$TMP/provision-wrapper.py" /usr/local/libexec/mtproxyl-egress-provision
 install -m 755 "$TMP/node-agent.py" /usr/local/libexec/mtproxyl-node-agent-source
 install -m 755 "$TMP/boot-guard.sh" /usr/local/libexec/mtproxyl-egress-boot-guard
 
 /usr/local/libexec/mtproxyl-egress-registry validate
+/usr/local/libexec/mtproxyl-egress-provision preflight | python3 -m json.tool >/dev/null
 
 cat >/etc/systemd/system/mtproxyl-egress-boot-guard.service <<'UNIT'
 [Unit]
