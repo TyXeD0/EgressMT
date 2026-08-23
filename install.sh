@@ -56,10 +56,11 @@ trm(){
         ru:menu5) echo "Установить или обновить интеграцию веб-панели";; en:menu5) echo "Install or update web-panel integration";;
         ru:menu6) echo "Показать статус";; en:menu6) echo "Show status";;
         ru:menu7) echo "Удалить EgressMT с входного VPS";; en:menu7) echo "Uninstall EgressMT from the entry VPS";;
+        ru:menu8) echo "Проверить совместимость после обновления MTProxyL/Telemt";; en:menu8) echo "Check compatibility after MTProxyL/Telemt updates";;
         ru:menu0) echo "Выход";; en:menu0) echo "Exit";;
         ru:installed) echo "MTProxyL уже установлен.";; en:installed) echo "MTProxyL is already installed.";;
-        ru:mtinstall) echo "Запускаю официальный установщик MTProxyL. Завершите его мастер настройки, затем вернитесь в EgressMT.";;
-        en:mtinstall) echo "Starting the official MTProxyL installer. Complete its setup wizard, then return to EgressMT.";;
+        ru:mtinstall) echo "Запускаю официальный установщик MTProxyL. Для EgressMT v0.1.0-rc1 оставьте движок Docker (вариант по умолчанию).";;
+        en:mtinstall) echo "Starting the official MTProxyL installer. For EgressMT v0.1.0-rc1 keep the Docker engine (the default choice).";;
         ru:needproxy) echo "Сначала необходимо установить и настроить MTProxyL/Telemt на входном VPS.";; en:needproxy) echo "MTProxyL/Telemt must be installed and configured on the entry VPS first.";;
         ru:firstexit) echo "Добавить первую выходную ноду сейчас? [Y/n]: ";; en:firstexit) echo "Add the first egress node now? [Y/n]: ";;
         ru:panelask) echo "Установить интеграцию EgressMT в MTProxyL Panel? [Y/n]: ";; en:panelask) echo "Install EgressMT integration into MTProxyL Panel? [Y/n]: ";;
@@ -103,6 +104,110 @@ download(){
     curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors "${RAW}/${path}" -o "$dest"
 }
 
+compat_json(){
+    mkdir -p "$TMP_DIR"
+    download "lib/compat.sh" "$TMP_DIR/compat.sh"
+    chmod 700 "$TMP_DIR/compat.sh"
+    "$TMP_DIR/compat.sh" --json
+}
+
+compat_record(){
+    mkdir -p "$TMP_DIR"
+    download "lib/compat.sh" "$TMP_DIR/compat.sh"
+    chmod 700 "$TMP_DIR/compat.sh"
+    "$TMP_DIR/compat.sh" --record >/dev/null 2>&1 || true
+}
+
+check_compatibility(){
+    command -v mtproxyl >/dev/null 2>&1 || { yellow "$(trm needproxy)"; return 1; }
+    mkdir -p "$TMP_DIR"
+    download "lib/compat.sh" "$TMP_DIR/compat.sh"
+    chmod 700 "$TMP_DIR/compat.sh"
+    echo
+    "$TMP_DIR/compat.sh" human
+    echo
+    local j
+    j="$($TMP_DIR/compat.sh --json)"
+    python3 - "$j" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1])
+for key,title in [('mtproxyl','MTProxyL'),('telemt','Telemt'),('panel','Panel')]:
+    x=d.get(key,{})
+    if x.get('changed_since_check'):
+        print(f"UPDATE DETECTED: {title} changed since the last successful EgressMT check")
+PY
+    if python3 - "$j" <<'PY' >/dev/null
+import json,sys
+raise SystemExit(0 if json.loads(sys.argv[1]).get('ok') else 1)
+PY
+    then
+        green "Compatibility contract: OK"
+    else
+        red "Compatibility contract: FAILED"
+        return 2
+    fi
+
+    local repatch
+    repatch="$(python3 - "$j" <<'PY'
+import json,sys
+print('yes' if json.loads(sys.argv[1]).get('panel',{}).get('needs_repatch') else 'no')
+PY
+)"
+    if [[ "$repatch" == yes && -x /usr/local/bin/egressmt ]]; then
+        if [[ "$LANG_CODE" == ru ]]; then
+            printf 'Обнаружена новая/официальная версия Panel без актуального патча EgressMT. Проверить патч полной сборкой и установить при успехе? [Y/n]: '
+        else
+            printf 'A new/official Panel without the current EgressMT patch was detected. Test a full patched build and install it if successful? [Y/n]: '
+        fi
+        read -r a
+        if [[ -z "$a" ]] || ! no_answer "$a"; then
+            install_panel
+            compat_record
+        fi
+    else
+        compat_record
+    fi
+}
+
+startup_compatibility_check(){
+    [[ -x /usr/local/bin/egressmt ]] || return 0
+    command -v mtproxyl >/dev/null 2>&1 || return 0
+    local j
+    j="$(compat_json 2>/dev/null || true)"
+    [[ -n "$j" ]] || return 0
+
+    local changed repatch ok
+    read -r changed repatch ok <<<"$(python3 - "$j" <<'PY'
+import json,sys
+try:d=json.loads(sys.argv[1])
+except Exception: print('no no no'); raise SystemExit
+changed=any(d.get(k,{}).get('changed_since_check') for k in ('mtproxyl','telemt','panel'))
+print('yes' if changed else 'no', 'yes' if d.get('panel',{}).get('needs_repatch') else 'no', 'yes' if d.get('ok') else 'no')
+PY
+)"
+
+    if [[ "$ok" != yes ]]; then
+        echo
+        yellow "EgressMT: upstream compatibility needs attention."
+        check_compatibility || true
+        pause
+        return 0
+    fi
+
+    if [[ "$changed" == yes || "$repatch" == yes ]]; then
+        echo
+        if [[ "$LANG_CODE" == ru ]]; then
+            yellow "EgressMT обнаружил изменение MTProxyL/Telemt/Panel после прошлой проверки."
+            echo "Сейчас будет выполнена безопасная проверка совместимости; рабочая Panel не заменяется, пока патч и полная сборка не пройдут успешно."
+        else
+            yellow "EgressMT detected an MTProxyL/Telemt/Panel change since the previous check."
+            echo "A safe compatibility check will run; the working Panel is not replaced unless patching and the full build succeed."
+        fi
+        check_compatibility || true
+        pause
+    fi
+}
+
 install_mtproxyl(){
     if command -v mtproxyl >/dev/null 2>&1; then
         green "$(trm installed)"
@@ -120,17 +225,38 @@ install_mtproxyl(){
 
 telemt_ready(){
     command -v mtproxyl >/dev/null 2>&1 || return 1
-    [[ -f /opt/mtproxyl/mtproxy/config.toml ]] && return 0
-    command -v docker >/dev/null 2>&1 && docker inspect mtproxyl >/dev/null 2>&1 && return 0
-    return 1
+    local j
+    j="$(mtproxyl mode --json 2>/dev/null || true)"
+    python3 - "$j" <<'PY' >/dev/null 2>&1
+import json,os,sys
+try:d=json.loads(sys.argv[1])
+except Exception: raise SystemExit(1)
+cfg=str(d.get('engine_config') or '')
+raise SystemExit(0 if d.get('running') and cfg and os.path.isfile(cfg) else 1)
+PY
 }
 
 install_core(){
     telemt_ready || { red "$(trm needproxy)"; return 1; }
+    local j
+    j="$(compat_json)"
+    if ! python3 - "$j" <<'PY' >/dev/null
+import json,sys
+raise SystemExit(0 if json.loads(sys.argv[1]).get('ok') else 1)
+PY
+    then
+        red "EgressMT v0.1.0-rc1 compatibility pre-flight failed."
+        python3 - "$j" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1]); print(d.get('reason') or 'unknown incompatibility')
+PY
+        return 1
+    fi
     mkdir -p "$TMP_DIR"
     download "lib/install-core.sh" "$TMP_DIR/install-core.sh"
     chmod 700 "$TMP_DIR/install-core.sh"
     EGRESSMT_LANG="$LANG_CODE" EGRESSMT_BRANCH="$BRANCH" bash "$TMP_DIR/install-core.sh"
+    compat_record
 }
 
 manage_nodes(){
@@ -145,6 +271,7 @@ install_panel(){
     download "panel/install.sh" "$TMP_DIR/install-panel.sh"
     chmod 700 "$TMP_DIR/install-panel.sh"
     EGRESSMT_LANG="$LANG_CODE" EGRESSMT_BRANCH="$BRANCH" bash "$TMP_DIR/install-panel.sh"
+    compat_record
 }
 
 full_install(){
@@ -203,6 +330,7 @@ menu(){
         echo "5) $(trm menu5)"
         echo "6) $(trm menu6)"
         echo "7) $(trm menu7)"
+        echo "8) $(trm menu8)"
         echo "0) $(trm menu0)"
         echo
         printf "> "
@@ -215,6 +343,7 @@ menu(){
             5) install_panel; pause ;;
             6) show_status; pause ;;
             7) uninstall_egressmt; pause ;;
+            8) check_compatibility; pause ;;
             0) exit 0 ;;
             *) sleep 1 ;;
         esac
@@ -225,4 +354,5 @@ choose_language
 need_root
 check_os
 command -v curl >/dev/null 2>&1 || { apt-get update -y; apt-get install -y curl ca-certificates; }
+startup_compatibility_check
 menu
