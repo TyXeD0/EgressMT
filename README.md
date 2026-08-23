@@ -22,6 +22,8 @@ EgressMT does **not** assume a country, provider, public IP range, node name or 
 
 **v0.1.0-rc1 — pre-release.** The failover core has been validated on real VPS infrastructure, including entry-host reboot, backup-node reboot, active-node failover/failback and fail-closed operation. A final clean-install validation from this repository is required before the first stable release.
 
+The release candidate currently targets the **Docker Telemt backend** of MTProxyL. MTProxyL also supports a binary Telemt backend; EgressMT detects it and refuses to claim compatibility instead of silently applying Docker-specific lifecycle logic.
+
 ## One-command installation
 
 Run on the entry VPS:
@@ -32,9 +34,21 @@ curl -fsSL https://raw.githubusercontent.com/TyXeD0/EgressMT/main/install.sh | s
 
 The very first screen asks for **Русский / English**. After that the installer is fully interactive: it explains each step, uses numbered choices and `y/n` confirmations, and can guide a non-technical user through the complete setup.
 
-The planned release-candidate flow includes installing/checking MTProxyL, installing EgressMT Core, adding/removing egress nodes over SSH, setting priorities, selecting AUTO/MANUAL/BLOCK modes, installing the optional Panel integration and showing system status.
+The release-candidate flow includes installing/checking MTProxyL, installing EgressMT Core, adding/removing egress nodes over SSH, setting priorities, selecting AUTO/MANUAL/BLOCK modes, installing the optional Panel integration and showing system status.
 
 Supported target for the first release candidate: **Ubuntu 24.04 LTS**.
+
+## Updating MTProxyL, Telemt or Panel
+
+You can update MTProxyL/Telemt with their normal upstream tools. Afterwards run the EgressMT one-command installer again.
+
+EgressMT records the upstream versions seen during the last successful compatibility check. On the next run it detects MTProxyL, Telemt and Panel changes and validates the runtime contract before doing anything destructive.
+
+For the web panel, EgressMT does **not** blindly apply a permanent patch to an old pinned source tree. It fetches the current MTProxyL Panel source, applies the EgressMT patch in a disposable build directory and performs a complete panel build first. The live panel binary is replaced only after both patching and the full build succeed. If a future upstream change breaks an anchor or compilation, the currently working panel is left untouched.
+
+The repository CI repeats the same panel patch/build against the current MTProxyL `main` branch every day, so upstream incompatibilities can be detected even before a user runs an update.
+
+The installer also has a separate **compatibility check** menu item. Telemt itself is not binary-patched by EgressMT; compatibility is based on the MTProxyL control contract, the active Telemt configuration and the DC-status API used by the failover manager.
 
 ## How it works
 
