@@ -29,8 +29,10 @@ The release candidate currently targets the **Docker Telemt backend** of MTProxy
 Run on the entry VPS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TyXeD0/EgressMT/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/TyXeD0/EgressMT/main/bootstrap.sh | sudo bash
 ```
+
+The small bootstrap downloads the interactive installer to a temporary file and runs it with the real terminal attached. This is intentional: piping the interactive installer itself into `bash` would consume its standard input and prevent the language/menu prompts from working correctly.
 
 The very first screen asks for **Русский / English**. After that the installer is fully interactive: it explains each step, uses numbered choices and `y/n` confirmations, and can guide a non-technical user through the complete setup.
 
