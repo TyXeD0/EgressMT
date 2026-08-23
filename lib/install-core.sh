@@ -21,19 +21,63 @@ fi
 
 msg "Проверка зависимостей..." "Checking dependencies..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null
-apt-get install -y ca-certificates curl python3 iproute2 iputils-ping nftables openssh-client sshpass software-properties-common >/dev/null
+apt-get -o DPkg::Lock::Timeout=120 update -y >/dev/null
+apt-get -o DPkg::Lock::Timeout=120 install -y ca-certificates curl gnupg python3 iproute2 iputils-ping nftables openssh-client sshpass dkms "linux-headers-$(uname -r)" >/dev/null
+
+# Do not use add-apt-repository here. It talks to the Launchpad REST API to
+# obtain the PPA key and may fail even when the actual PPA repository is fine
+# (for example GPGKeyTemporarilyNotFoundError / HTTP 500). EgressMT imports the
+# published PPA signing key directly, verifies its full fingerprint and writes
+# a modern signed-by Deb822 source instead.
+install_amneziawg(){
+    command -v awg >/dev/null 2>&1 && command -v awg-quick >/dev/null 2>&1 && return 0
+
+    local fpr="75C9DD72C799870E310542E24166F2C257290828"
+    local keyring="/usr/share/keyrings/amnezia-archive-keyring.gpg"
+    local source="/etc/apt/sources.list.d/amnezia-ppa.sources"
+    local armored="$TMP/amnezia-ppa.asc"
+    local got=""
+
+    msg "Устанавливаю AmneziaWG..." "Installing AmneziaWG..."
+    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 \
+        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${fpr}" -o "$armored" \
+        || fail "cannot download Amnezia PPA signing key"
+
+    got="$(gpg --batch --show-keys --with-colons "$armored" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+    [[ "$got" == "$fpr" ]] || fail "Amnezia PPA signing-key fingerprint mismatch"
+    install -d -m 755 /usr/share/keyrings
+    gpg --batch --yes --dearmor --output "$keyring" "$armored"
+    chmod 644 "$keyring"
+
+    cat >"$source" <<EOF
+Types: deb
+URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu
+Suites: noble
+Components: main
+Signed-By: $keyring
+EOF
+    chmod 644 "$source"
+
+    local ok=0
+    for delay in 0 3 10; do
+        (( delay == 0 )) || sleep "$delay"
+        if apt-get -o DPkg::Lock::Timeout=120 update -y >/dev/null; then
+            if apt-cache show amneziawg-tools >/dev/null 2>&1; then ok=1; break; fi
+        fi
+    done
+    (( ok == 1 )) || fail "Amnezia PPA is unavailable or does not publish packages for Ubuntu 24.04"
+
+    apt-get -o DPkg::Lock::Timeout=120 install -y amneziawg amneziawg-tools >/dev/null \
+        || fail "failed to install AmneziaWG packages"
+    command -v awg >/dev/null 2>&1 || fail "awg command is missing after installation"
+    command -v awg-quick >/dev/null 2>&1 || fail "awg-quick command is missing after installation"
+}
 
 if ! command -v docker >/dev/null 2>&1 || ! command -v mtproxyl >/dev/null 2>&1; then
     fail "MTProxyL/Telemt must be installed first"
 fi
 
-if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
-    msg "Устанавливаю AmneziaWG..." "Installing AmneziaWG..."
-    add-apt-repository -y ppa:amnezia/ppa >/dev/null
-    apt-get update -y >/dev/null
-    apt-get install -y amneziawg amneziawg-tools >/dev/null
-fi
+install_amneziawg
 
 TELEMT_CONFIG=""
 if [[ -f /opt/mtproxyl/mtproxy/config.toml ]]; then
@@ -69,6 +113,85 @@ for f in egressd.py cli.py registry.py provision.py node-agent.py boot-guard.sh;
     download "src/$f" "$TMP/$f"
 done
 download "lib/manage.sh" "$TMP/manage.sh"
+
+# rc1 hotfix: patch the downloaded canonical provisioner before installation so
+# remote EXIT preparation uses the same verified direct-PPA method as ENTRY.
+# This is intentionally exact-match/fail-closed: if provision.py changes, the
+# installer stops instead of silently applying a stale transformation.
+python3 - "$TMP/provision.py" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1])
+s=p.read_text()
+old=r'''def remote_packages(ssh: SSH) -> str:
+    script = r'''set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+. /etc/os-release
+[[ "${ID:-}" == "ubuntu" ]] || { echo "unsupported OS" >&2; exit 78; }
+apt-get update -y >/dev/null
+apt-get install -y software-properties-common ca-certificates iproute2 nftables python3 >/dev/null
+if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
+  add-apt-repository -y ppa:amnezia/ppa >/dev/null
+  apt-get update -y >/dev/null
+  apt-get install -y amneziawg amneziawg-tools >/dev/null
+fi
+command -v awg >/dev/null
+command -v awg-quick >/dev/null
+ip -4 route show default | awk 'NR==1{print $5}'
+'''
+    out = ssh.exec(script, timeout=300).splitlines()
+    if not out: fail("cannot detect remote external interface")
+    return out[-1].strip()
+'''
+new=r'''def remote_packages(ssh: SSH) -> str:
+    script = r'''set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+. /etc/os-release
+[[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] || { echo "Ubuntu 24.04 is required" >&2; exit 78; }
+APT=(apt-get -o DPkg::Lock::Timeout=120)
+"${APT[@]}" update -y >/dev/null
+"${APT[@]}" install -y ca-certificates curl gnupg iproute2 nftables python3 dkms "linux-headers-$(uname -r)" >/dev/null
+if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
+  FPR="75C9DD72C799870E310542E24166F2C257290828"
+  KEYRING="/usr/share/keyrings/amnezia-archive-keyring.gpg"
+  SOURCE="/etc/apt/sources.list.d/amnezia-ppa.sources"
+  KEY="$(mktemp /tmp/egressmt-amnezia-key.XXXXXX)"
+  trap 'rm -f "$KEY"' EXIT
+  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 \
+    "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${FPR}" -o "$KEY"
+  GOT="$(gpg --batch --show-keys --with-colons "$KEY" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+  [[ "$GOT" == "$FPR" ]] || { echo "Amnezia PPA signing-key fingerprint mismatch" >&2; exit 74; }
+  install -d -m 755 /usr/share/keyrings
+  gpg --batch --yes --dearmor --output "$KEYRING" "$KEY"
+  chmod 644 "$KEYRING"
+  cat >"$SOURCE" <<EOF
+Types: deb
+URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu
+Suites: noble
+Components: main
+Signed-By: $KEYRING
+EOF
+  chmod 644 "$SOURCE"
+  OK=0
+  for DELAY in 0 3 10; do
+    (( DELAY == 0 )) || sleep "$DELAY"
+    if "${APT[@]}" update -y >/dev/null && apt-cache show amneziawg-tools >/dev/null 2>&1; then OK=1; break; fi
+  done
+  (( OK == 1 )) || { echo "Amnezia PPA unavailable or package metadata missing" >&2; exit 75; }
+  "${APT[@]}" install -y amneziawg amneziawg-tools >/dev/null
+fi
+command -v awg >/dev/null
+command -v awg-quick >/dev/null
+ip -4 route show default | awk 'NR==1{print $5}'
+'''
+    out = ssh.exec(script, timeout=420).splitlines()
+    if not out: fail("cannot detect remote external interface")
+    return out[-1].strip()
+'''
+if old not in s:
+    raise SystemExit("provision.py remote_packages anchor changed; refusing stale hotfix")
+p.write_text(s.replace(old,new,1))
+PY
 
 python3 -m py_compile "$TMP/egressd.py" "$TMP/cli.py" "$TMP/registry.py" "$TMP/provision.py" "$TMP/node-agent.py"
 bash -n "$TMP/boot-guard.sh" "$TMP/manage.sh"
