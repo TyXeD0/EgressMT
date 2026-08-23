@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import socket
 import sys
+import time
 
 SOCKET = "/run/mtproxyl-egress/control.sock"
 EVENTS = Path("/var/lib/mtproxyl-egress/events.log")
@@ -13,28 +14,36 @@ EVENTS = Path("/var/lib/mtproxyl-egress/events.log")
 
 def request(payload: dict) -> dict:
     raw = (json.dumps(payload, ensure_ascii=False) + "\n").encode()
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(20)
-    try:
-        s.connect(SOCKET)
-        s.sendall(raw)
-        chunks = []
-        while True:
-            part = s.recv(65536)
-            if not part:
-                break
-            chunks.append(part)
-            if b"\n" in part:
-                break
-    finally:
-        s.close()
-    if not chunks:
-        raise RuntimeError("EgressMT daemon returned empty response")
-    reply = json.loads(b"".join(chunks).split(b"\n", 1)[0])
-    if not reply.get("ok"):
-        err = reply.get("error") or {}
-        raise RuntimeError(err.get("message") or "EgressMT request failed")
-    return reply["data"]
+    deadline = time.monotonic() + 20
+    last_exc: Exception | None = None
+    while True:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(20)
+        try:
+            s.connect(SOCKET)
+            s.sendall(raw)
+            chunks = []
+            while True:
+                part = s.recv(65536)
+                if not part:
+                    break
+                chunks.append(part)
+                if b"\n" in part:
+                    break
+            if not chunks:
+                raise RuntimeError("EgressMT daemon returned empty response")
+            reply = json.loads(b"".join(chunks).split(b"\n", 1)[0])
+            if not reply.get("ok"):
+                err = reply.get("error") or {}
+                raise RuntimeError(err.get("message") or "EgressMT request failed")
+            return reply["data"]
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            last_exc = exc
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"EgressMT daemon control socket is not ready: {exc}") from exc
+            time.sleep(0.25)
+        finally:
+            s.close()
 
 
 def human_bytes(value):
