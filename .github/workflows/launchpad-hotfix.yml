@@ -1,0 +1,93 @@
+name: Canonicalize AWG install hotfix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/launchpad-hotfix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch canonical provisioner and remove temporary install-time transform
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/provision.py')
+          s = p.read_text()
+          start = s.index('def remote_packages(ssh: SSH) -> str:\n')
+          end = s.index('\n\ndef remote_public_ip', start)
+          new = r'''def remote_packages(ssh: SSH) -> str:
+              script = r''' + "'''" + r'''set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          . /etc/os-release
+          [[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] || { echo "Ubuntu 24.04 is required" >&2; exit 78; }
+          APT=(apt-get -o DPkg::Lock::Timeout=120)
+          "${APT[@]}" update -y >/dev/null
+          "${APT[@]}" install -y ca-certificates curl gnupg iproute2 nftables python3 dkms "linux-headers-$(uname -r)" >/dev/null
+          if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
+            FPR="75C9DD72C799870E310542E24166F2C257290828"
+            KEYRING="/usr/share/keyrings/amnezia-archive-keyring.gpg"
+            SOURCE="/etc/apt/sources.list.d/amnezia-ppa.sources"
+            KEY="$(mktemp /tmp/egressmt-amnezia-key.XXXXXX)"
+            trap 'rm -f "$KEY"' EXIT
+            curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 \
+              "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${FPR}" -o "$KEY"
+            GOT="$(gpg --batch --show-keys --with-colons "$KEY" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+            [[ "$GOT" == "$FPR" ]] || { echo "Amnezia PPA signing-key fingerprint mismatch" >&2; exit 74; }
+            install -d -m 755 /usr/share/keyrings
+            gpg --batch --yes --dearmor --output "$KEYRING" "$KEY"
+            chmod 644 "$KEYRING"
+            cat >"$SOURCE" <<EOF
+          Types: deb
+          URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu
+          Suites: noble
+          Components: main
+          Signed-By: $KEYRING
+          EOF
+            chmod 644 "$SOURCE"
+            OK=0
+            for DELAY in 0 3 10; do
+              (( DELAY == 0 )) || sleep "$DELAY"
+              if "${APT[@]}" update -y >/dev/null && apt-cache show amneziawg-tools >/dev/null 2>&1; then OK=1; break; fi
+            done
+            (( OK == 1 )) || { echo "Amnezia PPA unavailable or package metadata missing" >&2; exit 75; }
+            "${APT[@]}" install -y amneziawg amneziawg-tools >/dev/null
+          fi
+          command -v awg >/dev/null
+          command -v awg-quick >/dev/null
+          ip -4 route show default | awk 'NR==1{print $5}'
+          ''' + "'''" + r'''
+              out = ssh.exec(script, timeout=420).splitlines()
+              if not out: fail("cannot detect remote external interface")
+              return out[-1].strip()
+          '''
+          p.write_text(s[:start] + new + s[end:])
+
+          q = Path('lib/install-core.sh')
+          t = q.read_text()
+          marker = '# rc1 hotfix: patch the downloaded canonical provisioner before installation so\n'
+          if marker in t:
+              a = t.index(marker)
+              b = t.index('python3 -m py_compile ', a)
+              t = t[:a] + t[b:]
+          q.write_text(t)
+          PY
+      - name: Validate
+        run: |
+          python3 -m py_compile src/provision.py
+          bash -n lib/install-core.sh
+          grep -q 'GPGKeyTemporarilyNotFoundError' lib/install-core.sh && exit 1 || true
+          ! grep -q 'add-apt-repository -y ppa:amnezia/ppa' src/provision.py
+      - name: Commit hotfix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/provision.py lib/install-core.sh
+          git commit -m 'Fix AWG provisioning without Launchpad REST API'
+          git push
