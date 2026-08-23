@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax
+        run: python3 -m py_compile src/*.py panel/*.py
+      - name: Shell syntax
+        run: bash -n install.sh lib/*.sh src/*.sh panel/*.sh scripts/*.sh
+      - name: Go syntax
+        run: gofmt panel/backend/egress.go >/dev/null
+      - name: Repository safety
+        run: bash scripts/repo-safety-check.sh
+
+  panel-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned MTProxyL source
+        run: |
+          git clone --filter=blob:none https://github.com/Liafanx/MTProxyL.git /tmp/MTProxyL
+          git -C /tmp/MTProxyL checkout 8e6ef1d598a2d4f3af2b4a81ac028b0f9ae7afe5
+      - name: Apply EgressMT panel patch
+        run: python3 panel/patch.py /tmp/MTProxyL/mtproxyl-panel panel
+      - name: Build patched panel
+        run: |
+          docker build \
+            --build-arg TARGETARCH=amd64 \
+            --build-arg VERSION=1.0.14-egressmt-rc1 \
+            -t egressmt-panel-ci \
+            /tmp/MTProxyL/mtproxyl-panel

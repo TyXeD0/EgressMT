@@ -1,0 +1,24 @@
+# Runtime / secrets
+*.key
+*.pem
+*.token
+*.env
+*.secret
+*.secrets
+
+# Generated production state
+nodes.d/
+registry/
+state/
+backups/
+*.backup
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
