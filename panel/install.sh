@@ -5,8 +5,7 @@ REPO="TyXeD0/EgressMT"
 BRANCH="${EGRESSMT_BRANCH:-main}"
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 LANG_CODE="${EGRESSMT_LANG:-en}"
-BASE_COMMIT="8e6ef1d598a2d4f3af2b4a81ac028b0f9ae7afe5"
-CUSTOM_VERSION="1.0.14-egressmt-rc1"
+EGRESSMT_VERSION="0.1.0-rc1"
 UPSTREAM="https://github.com/Liafanx/MTProxyL.git"
 
 WORK="/opt/egressmt-panel-build"
@@ -20,6 +19,8 @@ BRIDGE="/usr/local/sbin/mtproxyl-egress-panel-bridge"
 JOB_RUNNER="/usr/local/libexec/mtproxyl-egress-panel-job"
 PROVISIONER="/usr/local/libexec/mtproxyl-egress-provision"
 SUDOERS="/etc/sudoers.d/mtproxyl-panel-egress"
+META_DIR="/var/lib/egressmt"
+META_FILE="$META_DIR/panel-compat.json"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP="/root/egressmt-panel-backup-$STAMP"
 
@@ -29,7 +30,7 @@ fail(){ echo "ERROR: $*" >&2; exit 1; }
 
 for c in git docker python3 sudo visudo systemctl install curl; do command -v "$c" >/dev/null 2>&1 || fail "missing command: $c"; done
 [[ -x /usr/local/bin/egressmt ]] || fail "EgressMT Core must be installed first"
-[[ -x "$PROVISIONER" ]] || fail "EgressMT EXIT provisioner is missing"
+[[ -x "$PROVISIONER" ]] || fail "EgressMT egress-node provisioner is missing"
 systemctl is-active --quiet mtproxyl-egressd.service || fail "EgressMT daemon is not active"
 
 if [[ ! -x "$PANEL_BIN" || ! -f "$PANEL_CFG" ]]; then
@@ -42,8 +43,9 @@ id mtproxyl-panel >/dev/null 2>&1 || fail "mtproxyl-panel system user is missing
 /usr/local/libexec/mtproxyl-egress-registry validate
 "$PROVISIONER" preflight | python3 -m json.tool >/dev/null
 CURRENT_PANEL="$($PANEL_BIN version 2>/dev/null || true)"
+CURRENT_MTPROXYL="$(mtproxyl version 2>/dev/null || true)"
 
-msg "Подготавливаю EgressMT Panel..." "Preparing EgressMT Panel..."
+msg "Проверяю патч на текущем исходном коде MTProxyL Panel..." "Testing the patch against the current MTProxyL Panel source..."
 rm -rf "$WORK"
 install -d -m 755 "$ASSETS/backend" "$ASSETS/frontend"
 
@@ -57,20 +59,16 @@ download panel/frontend/api.fragment.ts "$ASSETS/frontend/api.fragment.ts"
 python3 -m py_compile "$ASSETS/patch.py" "$ASSETS/job-runner.py"
 bash -n "$ASSETS/bridge.sh"
 
-install -d -m 700 "$BACKUP"
-cp -a "$PANEL_BIN" "$BACKUP/mtproxyl-panel"
-cp -a "$PANEL_CFG" "$BACKUP/config.toml"
-cp -a "/etc/systemd/system/$PANEL_SERVICE" "$BACKUP/" 2>/dev/null || true
-cp -a "$BRIDGE" "$BACKUP/mtproxyl-egress-panel-bridge" 2>/dev/null || true
-cp -a "$JOB_RUNNER" "$BACKUP/mtproxyl-egress-panel-job" 2>/dev/null || true
-cp -a "$SUDOERS" "$BACKUP/mtproxyl-panel-egress.sudoers" 2>/dev/null || true
-printf '%s\n' "$CURRENT_PANEL" >"$BACKUP/version.txt"
-chmod -R go-rwx "$BACKUP"
+# Deliberately build against the current upstream source instead of a permanently
+# pinned historical commit. Nothing on the live server is replaced unless both
+# the source patch and the complete panel build succeed.
+git clone --filter=blob:none --depth=1 "$UPSTREAM" "$SRC"
+UPSTREAM_COMMIT="$(git -C "$SRC" rev-parse HEAD)"
+UPSTREAM_PANEL_VERSION="$(sed -nE 's/^[[:space:]]*var version = "([^"]+)".*/\1/p' "$PANEL_SRC/main.go" | head -n1)"
+[[ -n "$UPSTREAM_PANEL_VERSION" ]] || fail "cannot determine upstream panel version"
+CUSTOM_VERSION="${UPSTREAM_PANEL_VERSION}-egressmt-${EGRESSMT_VERSION}"
 
-msg "Получаю исходный код MTProxyL Panel..." "Fetching MTProxyL Panel source..."
-git clone --filter=blob:none --no-checkout "$UPSTREAM" "$SRC"
-git -C "$SRC" checkout "$BASE_COMMIT"
-[[ "$(git -C "$SRC" rev-parse HEAD)" == "$BASE_COMMIT" ]] || fail "upstream commit mismatch"
+msg "Upstream Panel: ${UPSTREAM_PANEL_VERSION}, commit ${UPSTREAM_COMMIT:0:12}" "Upstream Panel: ${UPSTREAM_PANEL_VERSION}, commit ${UPSTREAM_COMMIT:0:12}"
 python3 "$ASSETS/patch.py" "$PANEL_SRC" "$ASSETS"
 
 case "$(uname -m)" in
@@ -80,7 +78,7 @@ case "$(uname -m)" in
 esac
 IMAGE="egressmt-panel:$CUSTOM_VERSION"
 OUT="$WORK/mtproxyl-panel-egressmt"
-msg "Собираю панель. Это может занять несколько минут..." "Building the panel. This may take several minutes..."
+msg "Патч применился. Выполняю полную тестовую сборку панели..." "Patch applied. Running a complete test build of the panel..."
 docker build --build-arg TARGETARCH="$ARCH" --build-arg VERSION="$CUSTOM_VERSION" -t "$IMAGE" "$PANEL_SRC"
 CID="$(docker create "$IMAGE")"
 cleanup_cid(){ docker rm -f "$CID" >/dev/null 2>&1 || true; }
@@ -90,6 +88,19 @@ cleanup_cid
 trap - EXIT
 chmod 755 "$OUT"
 [[ "$($OUT version)" == *"$CUSTOM_VERSION"* ]] || fail "built panel version mismatch"
+
+# Only now, after compatibility has been proven, take the live backup and stage
+# the replacement. A future upstream source change that breaks an anchor or the
+# build therefore cannot damage the currently working panel.
+install -d -m 700 "$BACKUP"
+cp -a "$PANEL_BIN" "$BACKUP/mtproxyl-panel"
+cp -a "$PANEL_CFG" "$BACKUP/config.toml"
+cp -a "/etc/systemd/system/$PANEL_SERVICE" "$BACKUP/" 2>/dev/null || true
+cp -a "$BRIDGE" "$BACKUP/mtproxyl-egress-panel-bridge" 2>/dev/null || true
+cp -a "$JOB_RUNNER" "$BACKUP/mtproxyl-egress-panel-job" 2>/dev/null || true
+cp -a "$SUDOERS" "$BACKUP/mtproxyl-panel-egress.sudoers" 2>/dev/null || true
+printf '%s\n' "$CURRENT_PANEL" >"$BACKUP/version.txt"
+chmod -R go-rwx "$BACKUP"
 
 install -d -m 755 /usr/local/libexec /usr/local/sbin
 install -o root -g root -m 755 "$ASSETS/job-runner.py" "$JOB_RUNNER"
@@ -130,8 +141,19 @@ fi
 sleep 3
 systemctl is-active --quiet "$PANEL_SERVICE" || { /root/rollback-egressmt-panel.sh || true; fail "custom panel is not active; previous panel restored"; }
 
+install -d -m 700 "$META_DIR"
+python3 - "$META_FILE" "$UPSTREAM_PANEL_VERSION" "$UPSTREAM_COMMIT" "$CUSTOM_VERSION" "$CURRENT_MTPROXYL" <<'PY'
+import json,os,sys,tempfile
+path,up_ver,commit,custom,mt=sys.argv[1:]
+data={'upstream_panel_version':up_ver,'upstream_commit':commit,'custom_version':custom,'mtproxyl_version':mt}
+fd,tmp=tempfile.mkstemp(prefix='.panel-compat.',dir=os.path.dirname(path)); os.fchmod(fd,0o600)
+with os.fdopen(fd,'w') as f: json.dump(data,f,indent=2); f.write('\n'); f.flush(); os.fsync(f.fileno())
+os.replace(tmp,path)
+PY
+
 "$PANEL_BIN" version
 sudo -u mtproxyl-panel sudo -n "$BRIDGE" status | python3 -m json.tool >/dev/null
-msg "EgressMT Panel установлена. Откройте раздел EgressMT · EXIT nodes." "EgressMT Panel installed. Open EgressMT · EXIT nodes."
+msg "EgressMT Panel установлена поверх текущей совместимой версии upstream." "EgressMT Panel installed on top of the current compatible upstream version."
+echo "Upstream: $UPSTREAM_PANEL_VERSION @ ${UPSTREAM_COMMIT:0:12}"
 echo "Backup:   $BACKUP"
 echo "Rollback: /root/rollback-egressmt-panel.sh"
