@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+import shutil
 import sys
 
 CORE = Path("/usr/local/libexec/mtproxyl-egress-provision-core.py")
@@ -92,11 +94,41 @@ ip -4 route show default | awk 'NR==1{print $5}'
     return out[-1].strip()
 
 
+def install_preflight() -> dict:
+    """Validate provisioner files/tools before egressd is (re)started.
+
+    install-core runs this while upgrading files and before it restarts systemd.
+    The old core preflight also connected to the daemon Unix socket, which makes
+    an otherwise valid fresh install/update fail if the socket is not present at
+    that exact moment. Runtime daemon health is checked later by install-core via
+    `egressmt status --json` after the service restart.
+    """
+    checks = {
+        str(core.REGISTRY): Path(core.REGISTRY).exists(),
+        str(core.AGENT_SOURCE): Path(core.AGENT_SOURCE).exists(),
+        str(core.CONFIG): Path(core.CONFIG).exists(),
+    }
+    for cmd in ("awg", "awg-quick", "ssh", "sshpass"):
+        checks[cmd] = shutil.which(cmd) is not None
+    missing = [name for name, ok in checks.items() if not ok]
+    if missing:
+        raise RuntimeError("preflight failed: " + ", ".join(missing))
+    return {
+        "ok": True,
+        "version": core.VERSION,
+        "phase": "install",
+        "checks": checks,
+    }
+
+
 core.remote_packages = remote_packages
 
 if __name__ == "__main__":
     try:
-        core.main()
+        if len(sys.argv) == 2 and sys.argv[1] == "preflight":
+            print(json.dumps(install_preflight(), ensure_ascii=False, indent=2))
+        else:
+            core.main()
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
