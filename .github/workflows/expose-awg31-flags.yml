@@ -25,19 +25,16 @@ jobs:
                   raise SystemExit(f'{path}: {label} anchor not found')
               p.write_text(s.replace(old, new, 1))
 
-          # Provisioner registry persistence.
           replace_once('src/provision.py',
               '''        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),\n        ("transport_updated_at", q(n.get("transport_updated_at", ""))),''',
               '''        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),\n        ("random_trailers", "true" if bool(n.get("random_trailers", False)) else "false"),\n        ("disable_cookies", "true" if bool(n.get("disable_cookies", False)) else "false"),\n        ("transport_updated_at", q(n.get("transport_updated_at", ""))),''',
               'render transport fields')
 
-          # New-node path is formatted across multiple lines.
           replace_once('src/provision.py',
               '''        n["header_protection"] = bool(params.get("HeaderProtection", False))\n        n["transport_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())''',
               '''        n["header_protection"] = bool(params.get("HeaderProtection", False))\n        n["random_trailers"] = bool(params.get("RandomTrailers", False))\n        n["disable_cookies"] = bool(params.get("DisableCookies", False))\n        n["transport_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())''',
               'add transport assignments')
 
-          # Upgrade path is intentionally compact in rc1.
           replace_once('src/provision.py',
               '''        n["header_protection"]=bool(params.get("HeaderProtection",False)); n["transport_updated_at"]=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())''',
               '''        n["header_protection"]=bool(params.get("HeaderProtection",False)); n["random_trailers"]=bool(params.get("RandomTrailers",False)); n["disable_cookies"]=bool(params.get("DisableCookies",False)); n["transport_updated_at"]=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())''',
@@ -48,21 +45,21 @@ jobs:
               '''event(f"node_transport_upgrade id={node_id} profile={n['transport_profile']} hpk={1 if n['header_protection'] else 0} rt={1 if n.get('random_trailers') else 0} nocookie={1 if n.get('disable_cookies') else 0}")''',
               'upgrade event')
 
-          # Daemon persistence and status payload.
           replace_once('src/egressd.py',
               '''        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),\n        ("transport_updated_at", q(n.get("transport_updated_at", ""))),''',
               '''        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),\n        ("random_trailers", "true" if bool(n.get("random_trailers", False)) else "false"),\n        ("disable_cookies", "true" if bool(n.get("disable_cookies", False)) else "false"),\n        ("transport_updated_at", q(n.get("transport_updated_at", ""))),''',
               'daemon render transport fields')
 
-          p = Path('src/egressd.py'); s = p.read_text()
-          old = '''            "profile": str(n.get("transport_profile", "legacy")),\n            "header_protection": bool(n.get("header_protection", False)),\n            "mtu": int(n.get("transport_mtu", 0) or 0),'''
-          new = '''            "profile": str(n.get("transport_profile", "legacy")),\n            "header_protection": bool(n.get("header_protection", False)),\n            "random_trailers": bool(n.get("random_trailers", False)),\n            "disable_cookies": bool(n.get("disable_cookies", False)),\n            "mtu": int(n.get("transport_mtu", 0) or 0),'''
-          count = s.count(old)
-          if count != 2:
-              raise SystemExit(f'src/egressd.py: expected 2 status transport anchors, found {count}')
-          p.write_text(s.replace(old, new))
+          p = Path('src/egressd.py')
+          s = p.read_text()
+          needle = '            "header_protection": bool(n.get("header_protection", False)),\n'
+          repl = needle + '            "random_trailers": bool(n.get("random_trailers", False)),\n            "disable_cookies": bool(n.get("disable_cookies", False)),\n'
+          count = s.count(needle)
+          if count < 1:
+              raise SystemExit('src/egressd.py: status transport anchor not found')
+          s = s.replace(needle, repl)
+          p.write_text(s)
 
-          # CLI: visibly distinguish migrated old profile state from complete 3.1 flags.
           replace_once('src/cli.py',
               '''        hpk = "HPK" if transport.get("header_protection") else "no-HPK"\n        print(''',
               '''        hpk = "HPK" if transport.get("header_protection") else "no-HPK"\n        rt = "RT" if transport.get("random_trailers") else "no-RT"\n        cookies = "no-cookie" if transport.get("disable_cookies") else "cookies"\n        print(''',
@@ -72,7 +69,6 @@ jobs:
               '''f"transport={transport.get('profile') or 'legacy'}/{hpk}/{rt}/{cookies} "''',
               'cli transport format')
 
-          # Panel: additive fields are read defensively, so upstream API typing remains compatible.
           replace_once('panel/frontend/EgressPage.tsx',
               '''  const c = node.connectivity || {};\n  const a = node.agent || { reachable: false };''',
               '''  const c = node.connectivity || {};\n  const a = node.agent || { reachable: false };\n  const tr = node.transport as (typeof node.transport & { random_trailers?: boolean; disable_cookies?: boolean });''',
