@@ -44,6 +44,8 @@ def _probe_args(iface: str, key_path: str, hpk_path: str | None = None) -> list[
         "reject-after-time", "170-190",
         "keepalive-timeout", "8-12",
         "max-handshake-attempts", "16-24",
+        "random-trailers", "on",
+        "disable-cookies", "on",
     ]
     if hpk_path:
         args += ["header-protection-key", hpk_path]
@@ -211,7 +213,9 @@ probe_awg31() {
     rekey-timeout 4-7
     reject-after-time 170-190
     keepalive-timeout 8-12
-    max-handshake-attempts 16-24)
+    max-handshake-attempts 16-24
+    random-trailers on
+    disable-cookies on)
   [[ "$with_hpk" == 1 ]] && ARGS+=(header-protection-key "$hpk")
   "${ARGS[@]}" >/dev/null 2>&1
   rc=$?
@@ -297,6 +301,8 @@ def awg_params() -> dict[str, object]:
         "RejectAfterTime": f"{r.randint(165, 175)}-{r.randint(185, 200)}",
         "KeepaliveTimeout": f"{r.randint(8, 10)}-{r.randint(11, 15)}",
         "MaxHandshakeAttempts": f"{r.randint(16, 19)}-{r.randint(21, 26)}",
+        "RandomTrailers": True,
+        "DisableCookies": True,
         "PersistentKeepalive": f"{r.randint(20, 23)}-{r.randint(27, 32)}",
         "MTU": AWG_MTU,
         "Profile": AWG_PROFILE,
@@ -333,6 +339,12 @@ def config_text(*, private: str, address: str, peer_public: str, allowed_cidr: s
         "KeepaliveTimeout", "MaxHandshakeAttempts",
     ):
         lines.append(f"{k} = {params[k]}")
+    lines.append("RandomTrailers = on")
+    # DisableCookies removes the cookie-reply path, reducing another recognizable
+    # handshake behavior. This is intentionally enabled for private point-to-point
+    # EgressMT links; operators should note the corresponding loss of cookie-based
+    # DoS mitigation on the AWG interface.
+    lines.append("DisableCookies = on")
     if params.get("HeaderProtectionKey"):
         lines.append(f"HeaderProtectionKey = {params['HeaderProtectionKey']}")
     lines += [
@@ -372,6 +384,8 @@ def install_preflight() -> dict:
             "profile": AWG_PROFILE,
             "mtu": AWG_MTU,
             "awg31": True,
+            "random_trailers": True,
+            "disable_cookies": True,
             "header_protection_supported": hpk,
         },
     }
