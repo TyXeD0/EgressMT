@@ -1,0 +1,111 @@
+name: Fix node-agent source binding
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-agent-source-bind.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bind node-agent requests to tunnel source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/egressd.py')
+          s = p.read_text()
+
+          old_import = 'import fcntl\nimport ipaddress\nimport json\n'
+          new_import = 'import fcntl\nimport http.client\nimport ipaddress\nimport json\n'
+          if old_import not in s:
+              raise SystemExit('import anchor not found')
+          s = s.replace(old_import, new_import, 1)
+
+          old = '''def agent_node(n: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    token_path = Path(str(n.get("agent_token_file", "")))
+    if not token_path.is_file():
+        return {"reachable": False, "error": "token_missing"}, None
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+        req = urllib.request.Request(
+            f"http://{n['remote_tunnel_ip']}:{int(n.get('agent_port', 9784))}/metrics",
+            headers={"Authorization": "Bearer " + token},
+        )
+        started = time.monotonic()
+        with urllib.request.urlopen(req, timeout=2.5) as r:
+            data = json.loads(r.read())
+        agent = {
+            "reachable": True,
+            "request_ms": round((time.monotonic() - started) * 1000, 1),
+            "version": data.get("version"),
+            "error": None,
+        }
+        system = {k: data.get(k) for k in ("hostname", "uptime_sec", "cpu", "memory", "disk", "network")}
+        return agent, system
+    except Exception as exc:
+        return {"reachable": False, "error": type(exc).__name__}, None
+'''
+
+          new = '''def agent_node(n: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Query the private node-agent strictly through this node's tunnel.
+
+    The agent rejects any source other than local_tunnel_ip.  Binding the TCP
+    socket also prevents environment HTTP proxy settings from diverting this
+    private request away from the AWG interface.
+    """
+    token_path = Path(str(n.get("agent_token_file", "")))
+    if not token_path.is_file():
+        return {"reachable": False, "error": "token_missing"}, None
+    conn: http.client.HTTPConnection | None = None
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+        host = str(n["remote_tunnel_ip"])
+        port = int(n.get("agent_port", 9784))
+        local = str(n["local_tunnel_ip"])
+        started = time.monotonic()
+        conn = http.client.HTTPConnection(
+            host,
+            port,
+            timeout=2.5,
+            source_address=(local, 0),
+        )
+        conn.request("GET", "/metrics", headers={"Authorization": "Bearer " + token})
+        response = conn.getresponse()
+        raw = response.read()
+        if response.status != 200:
+            raise RuntimeError(f"node-agent HTTP {response.status}")
+        data = json.loads(raw)
+        agent = {
+            "reachable": True,
+            "request_ms": round((time.monotonic() - started) * 1000, 1),
+            "version": data.get("version"),
+            "error": None,
+        }
+        system = {k: data.get(k) for k in ("hostname", "uptime_sec", "cpu", "memory", "disk", "network")}
+        return agent, system
+    except Exception as exc:
+        return {"reachable": False, "error": type(exc).__name__}, None
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+'''
+
+          if old not in s:
+              raise SystemExit('agent_node anchor not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+          python3 -m py_compile src/egressd.py
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/egressd.py
+          git commit -m 'Bind node-agent queries to AWG tunnel source'
+          git push
