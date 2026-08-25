@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+from pathlib import Path
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    p = Path(path)
+    s = p.read_text()
+    if old not in s:
+        raise SystemExit(f"{path}: anchor not found:\n{old[:300]}")
+    p.write_text(s.replace(old, new, 1))
+
+
+# egressd: multi-DC probes; ICMP is diagnostic only.
+replace_once(
+    "src/egressd.py",
+    'TEST_TELEGRAM_IP = "149.154.167.51"\nTEST_TELEGRAM_PORT = 443\n',
+    '''TELEGRAM_PROBES = [
+    ("dc1", "149.154.175.50"),
+    ("dc2", "149.154.167.51"),
+    ("dc3", "149.154.175.100"),
+    ("dc4", "149.154.167.91"),
+    ("dc5", "91.108.56.151"),
+]
+TELEGRAM_PROBE_PORT = 443
+''',
+)
+
+replace_once(
+    "src/egressd.py",
+    '''def tcp_node(n: dict[str, Any]) -> tuple[bool, float | None]:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(2.5)
+    started = time.monotonic()
+    try:
+        s.bind((str(n["local_tunnel_ip"]), 0))
+        s.connect((TEST_TELEGRAM_IP, TEST_TELEGRAM_PORT))
+        return True, round((time.monotonic() - started) * 1000, 1)
+    except OSError:
+        return False, None
+    finally:
+        s.close()
+
+
+def health_node(n: dict[str, Any], handshake_max_age: int) -> dict[str, Any]:
+    iface = str(n["awg_interface"])
+    iface_up = (Path("/sys/class/net") / iface).exists()
+    age = latest_handshake_age(iface) if iface_up else -1
+    rx, tx = awg_transfer(iface) if iface_up else (0, 0)
+    hs_ok = iface_up and 0 <= age <= handshake_max_age
+    ping_ok, rtt = ping_node(n) if iface_up else (False, None)
+    tg_ok, tg_ms = tcp_node(n) if ping_ok else (False, None)
+    enabled = bool(n.get("enabled", True))
+    return {
+        "id": str(n["id"]),
+        "name": str(n["name"]),
+        "enabled": enabled,
+        "priority": int(n["priority"]),
+        "public_ip": str(n.get("public_ip", "")),
+        "health": enabled and hs_ok and ping_ok and tg_ok,
+        "awg": {
+            "interface": iface, "up": iface_up, "handshake_age_sec": age,
+            "rx_bytes": rx, "tx_bytes": tx,
+        },
+        "connectivity": {
+            "tunnel": ping_ok, "tunnel_rtt_ms": rtt,
+            "telegram": tg_ok, "telegram_tcp_ms": tg_ms,
+        },
+    }
+''',
+    '''def _tcp_probe(local_ip: str, host: str, timeout: float = 2.5) -> tuple[bool, float | None]:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    started = time.monotonic()
+    try:
+        s.bind((local_ip, 0))
+        s.connect((host, TELEGRAM_PROBE_PORT))
+        return True, round((time.monotonic() - started) * 1000, 1)
+    except OSError:
+        return False, None
+    finally:
+        s.close()
+
+
+def telegram_node(n: dict[str, Any]) -> tuple[bool, float | None, str | None, str | None, int]:
+    """Probe Telegram through a node; any reachable Telegram DC is sufficient."""
+    local = str(n["local_tunnel_ip"])
+    seed = sum(str(n.get("id", "")).encode()) + int(time.time() // 60)
+    start = seed % len(TELEGRAM_PROBES)
+    ordered = TELEGRAM_PROBES[start:] + TELEGRAM_PROBES[:start]
+    attempts = 0
+    for label, host in ordered:
+        attempts += 1
+        ok, ms = _tcp_probe(local, host)
+        if ok:
+            return True, ms, label, host, attempts
+    return False, None, None, None, attempts
+
+
+def health_node(n: dict[str, Any], handshake_max_age: int) -> dict[str, Any]:
+    iface = str(n["awg_interface"])
+    iface_up = (Path("/sys/class/net") / iface).exists()
+    age = latest_handshake_age(iface) if iface_up else -1
+    rx, tx = awg_transfer(iface) if iface_up else (0, 0)
+    hs_ok = iface_up and 0 <= age <= handshake_max_age
+    ping_ok, rtt = ping_node(n) if iface_up else (False, None)
+    tg_ok, tg_ms, tg_label, tg_ip, tg_attempts = telegram_node(n) if iface_up else (False, None, None, None, 0)
+    enabled = bool(n.get("enabled", True))
+    return {
+        "id": str(n["id"]),
+        "name": str(n["name"]),
+        "enabled": enabled,
+        "priority": int(n["priority"]),
+        "public_ip": str(n.get("public_ip", "")),
+        "health": enabled and hs_ok and tg_ok,
+        "awg": {
+            "interface": iface, "up": iface_up, "handshake_age_sec": age,
+            "rx_bytes": rx, "tx_bytes": tx,
+        },
+        "transport": {
+            "profile": str(n.get("transport_profile", "legacy")),
+            "header_protection": bool(n.get("header_protection", False)),
+            "mtu": int(n.get("transport_mtu", 0) or 0),
+            "updated_at": str(n.get("transport_updated_at", "")) or None,
+        },
+        "connectivity": {
+            "tunnel": ping_ok, "tunnel_rtt_ms": rtt,
+            "telegram": tg_ok, "telegram_tcp_ms": tg_ms,
+            "telegram_target": tg_label, "telegram_ip": tg_ip,
+            "telegram_probes_tried": tg_attempts,
+            "telegram_probe_total": len(TELEGRAM_PROBES),
+        },
+    }
+''',
+)
+
+replace_once(
+    "src/egressd.py",
+    '''        ("agent_token_file", q(n.get("agent_token_file", ""))),
+        ("provisioned", "true" if bool(n.get("provisioned", True)) else "false"),
+''',
+    '''        ("agent_token_file", q(n.get("agent_token_file", ""))),
+        ("transport_profile", q(n.get("transport_profile", "legacy"))),
+        ("transport_mtu", str(int(n.get("transport_mtu", 0) or 0))),
+        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),
+        ("transport_updated_at", q(n.get("transport_updated_at", ""))),
+        ("provisioned", "true" if bool(n.get("provisioned", True)) else "false"),
+''',
+)
+
+replace_once(
+    "src/egressd.py",
+    '''                        "awg": {"interface": str(n["awg_interface"]), "up": False, "handshake_age_sec": -1},
+                        "connectivity": {"tunnel": False, "tunnel_rtt_ms": None, "telegram": False},
+                        "error": type(exc).__name__,
+''',
+    '''                        "awg": {"interface": str(n["awg_interface"]), "up": False, "handshake_age_sec": -1},
+                        "transport": {
+                            "profile": str(n.get("transport_profile", "legacy")),
+                            "header_protection": bool(n.get("header_protection", False)),
+                            "mtu": int(n.get("transport_mtu", 0) or 0),
+                            "updated_at": str(n.get("transport_updated_at", "")) or None,
+                        },
+                        "connectivity": {
+                            "tunnel": False, "tunnel_rtt_ms": None, "telegram": False,
+                            "telegram_target": None, "telegram_ip": None,
+                            "telegram_probes_tried": 0, "telegram_probe_total": len(TELEGRAM_PROBES),
+                        },
+                        "error": type(exc).__name__,
+''',
+)
+
+replace_once(
+    "src/egressd.py",
+    '''        print(f"{r['priority']:>3} {r['name']} [{r['id']}] {'HEALTHY' if r['health'] else 'DOWN'} hs={r['awg']['handshake_age_sec']}s rtt={r['connectivity']['tunnel_rtt_ms']}ms TG={'OK' if r['connectivity']['telegram'] else 'FAIL'}")
+''',
+    '''        target = r.get("connectivity", {}).get("telegram_target") or "—"
+        print(f"{r['priority']:>3} {r['name']} [{r['id']}] {'HEALTHY' if r['health'] else 'DOWN'} hs={r['awg']['handshake_age_sec']}s rtt={r['connectivity']['tunnel_rtt_ms']}ms TG={'OK' if r['connectivity']['telegram'] else 'FAIL'} target={target}")
+''',
+)
+
+# Provisioner core: multi-DC validation and transport metadata.
+replace_once(
+    "src/provision.py",
+    'TEST_TELEGRAM_IP = "149.154.167.51"\nTEST_TELEGRAM_PORT = 443\n',
+    '''TELEGRAM_PROBES = [
+    ("dc1", "149.154.175.50"),
+    ("dc2", "149.154.167.51"),
+    ("dc3", "149.154.175.100"),
+    ("dc4", "149.154.167.91"),
+    ("dc5", "91.108.56.151"),
+]
+TELEGRAM_PROBE_PORT = 443
+''',
+)
+
+replace_once(
+    "src/provision.py",
+    '''        ("agent_token_file", q(n.get("agent_token_file", ""))),
+        ("provisioned", "true" if bool(n.get("provisioned", True)) else "false"),
+''',
+    '''        ("agent_token_file", q(n.get("agent_token_file", ""))),
+        ("transport_profile", q(n.get("transport_profile", "legacy"))),
+        ("transport_mtu", str(int(n.get("transport_mtu", 0) or 0))),
+        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),
+        ("transport_updated_at", q(n.get("transport_updated_at", ""))),
+        ("provisioned", "true" if bool(n.get("provisioned", True)) else "false"),
+''',
+)
+
+replace_once(
+    "src/provision.py",
+    '    p=run(["ip","route","get",TEST_TELEGRAM_IP,"from",local,"mark","0x200000"],check=False)\n',
+    '    p=run(["ip","route","get",TELEGRAM_PROBES[0][1],"from",local,"mark","0x200000"],check=False)\n',
+)
+
+replace_once(
+    "src/provision.py",
+    '''def ping_tunnel(iface: str, remote: str, timeout_sec: int=30) -> float:
+    deadline=time.monotonic()+timeout_sec; last=""
+    while time.monotonic()<deadline:
+        p=run(["ping","-I",iface,"-c","1","-W","1",remote],check=False,timeout=3); last=p.stderr or p.stdout
+        if p.returncode==0:
+            m=re.search(r"time[=<]([0-9.]+)\\s*ms",p.stdout); return float(m.group(1)) if m else 0.0
+        time.sleep(1)
+    fail("AWG tunnel ping failed: "+last.strip())
+
+
+def telegram_tcp(local_ip: str) -> float:
+    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(5); started=time.monotonic()
+    try: s.bind((local_ip,0)); s.connect((TEST_TELEGRAM_IP,TEST_TELEGRAM_PORT)); return round((time.monotonic()-started)*1000,1)
+    finally: s.close()
+''',
+    '''def ping_tunnel(iface: str, remote: str, timeout_sec: int=5) -> float | None:
+    """Best-effort ICMP diagnostic; Telegram reachability is authoritative."""
+    deadline=time.monotonic()+timeout_sec
+    while time.monotonic()<deadline:
+        p=run(["ping","-I",iface,"-c","1","-W","1",remote],check=False,timeout=3)
+        if p.returncode==0:
+            m=re.search(r"time[=<]([0-9.]+)\\s*ms",p.stdout); return float(m.group(1)) if m else 0.0
+        time.sleep(0.5)
+    return None
+
+
+def telegram_tcp(local_ip: str) -> tuple[float, str]:
+    errors: list[str] = []
+    for label, host in TELEGRAM_PROBES:
+        s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(4); started=time.monotonic()
+        try:
+            s.bind((local_ip,0)); s.connect((host,TELEGRAM_PROBE_PORT))
+            return round((time.monotonic()-started)*1000,1), label
+        except OSError as exc:
+            errors.append(f"{label}:{type(exc).__name__}")
+        finally:
+            s.close()
+    fail("Telegram TCP failed for all probe DCs: "+", ".join(errors))
+''',
+)
+
+replace_once(
+    "src/provision.py",
+    '''        remote_priv=ssh.exec("umask 077; awg genkey").strip(); remote_pub=ssh.exec(f"printf '%s\\\\n' {shlex.quote(remote_priv)} | awg pubkey").strip(); params=awg_params()
+        local_text=config_text(private=local_priv,address=n["local_tunnel_ip"],peer_public=remote_pub,allowed_cidr="0.0.0.0/0",params=params,endpoint=f"{host}:{n['awg_port']}")
+''',
+    '''        remote_priv=ssh.exec("umask 077; awg genkey").strip(); remote_pub=ssh.exec(f"printf '%s\\\\n' {shlex.quote(remote_priv)} | awg pubkey").strip(); params=awg_params()
+        n["transport_profile"] = str(params.get("Profile", "legacy"))
+        n["transport_mtu"] = int(params.get("MTU", 0) or 0)
+        n["header_protection"] = bool(params.get("HeaderProtection", False))
+        n["transport_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        local_text=config_text(private=local_priv,address=n["local_tunnel_ip"],peer_public=remote_pub,allowed_cidr="0.0.0.0/0",params=params,endpoint=f"{host}:{n['awg_port']}")
+''',
+)
+
+replace_once(
+    "src/provision.py",
+    '''        rtt=ping_tunnel(str(n["awg_interface"]),str(n["remote_tunnel_ip"])); candidate_route_up(n)
+        try: tg_ms=telegram_tcp(str(n["local_tunnel_ip"]))
+        finally: candidate_route_down(n,flush=False)
+''',
+    '''        rtt=ping_tunnel(str(n["awg_interface"]),str(n["remote_tunnel_ip"])); candidate_route_up(n)
+        try: tg_ms,tg_target=telegram_tcp(str(n["local_tunnel_ip"]))
+        finally: candidate_route_down(n,flush=False)
+''',
+)
+replace_once(
+    "src/provision.py",
+    '''        return {"id":n["id"],"name":n["name"],"public_ip":n["public_ip"],"priority":n["priority"],"interface":n["awg_interface"],"tunnel_rtt_ms":rtt,"telegram_tcp_ms":tg_ms,"health":True}
+''',
+    '''        return {"id":n["id"],"name":n["name"],"public_ip":n["public_ip"],"priority":n["priority"],"interface":n["awg_interface"],"transport_profile":n.get("transport_profile"),"header_protection":n.get("header_protection",False),"tunnel_rtt_ms":rtt,"telegram_tcp_ms":tg_ms,"telegram_target":tg_target,"health":True}
+''',
+)
+
+upgrade_code = r'''
+
+def _restore_control_after_transport(node_id: str, was_enabled: bool, old_mode: str, old_manual: str | None) -> None:
+    if was_enabled:
+        with contextlib.suppress(Exception): control({"action":"node_enable","node":node_id})
+    if old_mode == "manual" and old_manual == node_id and was_enabled:
+        with contextlib.suppress(Exception): control({"action":"set_mode","mode":"manual","node":node_id})
+
+
+def upgrade_node(req: dict[str, Any]) -> dict[str, Any]:
+    """Transactionally rotate keys/port and migrate a managed node to current AWG."""
+    n=find_node(str(req.get("node") or "")); node_id=str(n["id"]); iface=str(n["awg_interface"])
+    auth=dict(req.get("auth") or {})
+    ssh=SSH(str(n.get("ssh_host") or n.get("public_ip")),int(n.get("ssh_port",22)),str(n.get("ssh_user","root")),auth)
+    local_cfg=Path("/etc/amnezia/amneziawg")/f"{iface}.conf"; remote_cfg=f"/etc/amnezia/amneziawg/{iface}.conf"
+    if not local_cfg.is_file():
+        ssh.close(); fail("local AWG config is missing")
+    old_local=local_cfg.read_text(encoding="utf-8"); old_remote=""; remote_backed=False; local_changed=False; remote_changed=False
+    original=dict(n); original.pop("_path",None)
+    status=control({"action":"status"}); old_mode=str(status.get("mode") or "auto"); old_manual=status.get("manual_node")
+    was_enabled=bool(n.get("enabled",True))
+    stamp=time.strftime("%Y%m%d-%H%M%S",time.gmtime())
+    local_backup=STATE_DIR/"transport-backups"/f"{node_id}-{stamp}.conf"
+    remote_backup=f"/etc/egressmt-node/backups/{node_id}-{stamp}.conf"
+    try:
+        if ssh.exec("id -u").strip()!="0": fail("SSH user must be root")
+        if not remote_marker_matches(ssh,node_id,iface): fail("remote ownership marker mismatch")
+        old_remote=ssh.exec(f"cat {shlex.quote(remote_cfg)}")+"\n"
+        local_backup.parent.mkdir(parents=True,exist_ok=True); atomic_write(local_backup,old_local,0o600)
+        remote_write(ssh,remote_backup,old_remote,0o600); remote_backed=True
+
+        if old_mode=="manual" and old_manual==node_id:
+            control({"action":"set_mode","mode":"auto"})
+        if was_enabled:
+            control({"action":"node_disable","node":node_id}); wait_not_active(node_id)
+
+        remote_packages(ssh); n["public_ip"]=remote_public_ip(ssh)
+        new_port=random.SystemRandom().randint(20000,59999)
+        local_priv=run(["awg","genkey"]).stdout.strip(); local_pub=run(["awg","pubkey"],input_text=local_priv+"\n").stdout.strip()
+        remote_priv=ssh.exec("umask 077; awg genkey").strip(); remote_pub=ssh.exec(f"printf '%s\\n' {shlex.quote(remote_priv)} | awg pubkey").strip()
+        params=awg_params(); n["awg_port"]=new_port
+        n["transport_profile"]=str(params.get("Profile","legacy")); n["transport_mtu"]=int(params.get("MTU",0) or 0)
+        n["header_protection"]=bool(params.get("HeaderProtection",False)); n["transport_updated_at"]=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
+        endpoint=str(n.get("endpoint") or n.get("ssh_host") or n.get("public_ip"))
+        local_text=config_text(private=local_priv,address=n["local_tunnel_ip"],peer_public=remote_pub,allowed_cidr="0.0.0.0/0",params=params,endpoint=f"{endpoint}:{new_port}")
+        remote_text=config_text(private=remote_priv,address=n["remote_tunnel_ip"],peer_public=local_pub,allowed_cidr=f"{n['local_tunnel_ip']}/32",params=params,listen=new_port)
+
+        remote_write(ssh,remote_cfg,remote_text,0o600); remote_changed=True
+        remote_unit=f"awg-quick@{iface}.service"
+        ssh.exec(f"systemctl restart {shlex.quote(remote_unit)}; systemctl is-active --quiet {shlex.quote(remote_unit)}; awg show {shlex.quote(iface)} >/dev/null")
+        atomic_write(local_cfg,local_text,0o600); local_changed=True
+        local_unit=f"awg-quick@{iface}.service"
+        run(["systemctl","restart",local_unit]); run(["systemctl","is-active","--quiet",local_unit])
+
+        rtt=ping_tunnel(iface,str(n["remote_tunnel_ip"])); candidate_route_up(n)
+        try: tg_ms,tg_target=telegram_tcp(str(n["local_tunnel_ip"]))
+        finally: candidate_route_down(n,flush=False)
+        token_path=Path(str(n.get("agent_token_file", "")))
+        if not token_path.is_file(): fail("node-agent token is missing")
+        agent_check(n,token_path.read_text(encoding="utf-8").strip())
+
+        atomic_write(NODES_DIR/f"{node_id}.toml",render_node(n),0o600); run([str(REGISTRY),"validate"]); control({"action":"reload"})
+        if was_enabled: control({"action":"node_enable","node":node_id})
+        if old_mode=="manual" and old_manual==node_id and was_enabled: control({"action":"set_mode","mode":"manual","node":node_id})
+        test=control({"action":"node_test","node":node_id}) if was_enabled else {"health":True}
+        if was_enabled and not test.get("health"): fail("upgraded node did not become healthy")
+        event(f"node_transport_upgrade id={node_id} profile={n['transport_profile']} hpk={1 if n['header_protection'] else 0}")
+        return {"id":node_id,"name":n["name"],"transport_profile":n["transport_profile"],"header_protection":n["header_protection"],"port":new_port,"tunnel_rtt_ms":rtt,"telegram_tcp_ms":tg_ms,"telegram_target":tg_target,"health":bool(test.get("health",True)),"backup":str(local_backup)}
+    except Exception:
+        with contextlib.suppress(Exception): atomic_write(NODES_DIR/f"{node_id}.toml",render_node(original),0o600)
+        if remote_changed and remote_backed and old_remote:
+            with contextlib.suppress(Exception):
+                remote_write(ssh,remote_cfg,old_remote,0o600)
+                ssh.exec(f"systemctl restart {shlex.quote('awg-quick@'+iface+'.service')}")
+        if local_changed:
+            with contextlib.suppress(Exception):
+                atomic_write(local_cfg,old_local,0o600); run(["systemctl","restart",f"awg-quick@{iface}.service"],check=False)
+        with contextlib.suppress(Exception): run([str(REGISTRY),"validate"])
+        with contextlib.suppress(Exception): control({"action":"reload"})
+        _restore_control_after_transport(node_id,was_enabled,old_mode,str(old_manual) if old_manual else None)
+        raise
+    finally:
+        ssh.close()
+'''
+replace_once(
+    "src/provision.py",
+    "\ndef wait_not_active(node_id: str, timeout: int=45) -> None:\n",
+    upgrade_code + "\n\ndef wait_not_active(node_id: str, timeout: int=45) -> None:\n",
+)
+replace_once(
+    "src/provision.py",
+    '''        if action=="add": return add_node(req)
+        if action=="remove": return remove_node(req)
+        fail("unknown action")
+''',
+    '''        if action=="add": return add_node(req)
+        if action=="remove": return remove_node(req)
+        if action=="upgrade": return upgrade_node(req)
+        fail("unknown action")
+''',
+)
+replace_once(
+    "src/provision.py",
+    '        if action not in {"add","remove"}: fail("request action must be add/remove")\n',
+    '        if action not in {"add","remove","upgrade"}: fail("request action must be add/remove/upgrade")\n',
+)
+
+# Wrapper: always apt-update AWG and keep all generated header ranges below 2e9.
+replace_once(
+    "src/provision-wrapper.py",
+    '''if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
+  FPR="75C9DD72C799870E310542E24166F2C257290828"
+''',
+    '''FPR="75C9DD72C799870E310542E24166F2C257290828"
+''',
+)
+replace_once(
+    "src/provision-wrapper.py",
+    '''  "${APT[@]}" install -y amneziawg amneziawg-tools >/dev/null
+fi
+
+command -v awg >/dev/null
+''',
+    '''"${APT[@]}" install -y amneziawg amneziawg-tools >/dev/null
+
+command -v awg >/dev/null
+''',
+)
+replace_once(
+    "src/provision-wrapper.py",
+    '''    windows = [
+        (100_000_000, 850_000_000),
+        (1_000_000_000, 1_750_000_000),
+        (1_900_000_000, 2_650_000_000),
+        (2_800_000_000, 3_950_000_000),
+    ]
+''',
+    '''    windows = [
+        (100_000_000, 450_000_000),
+        (550_000_000, 900_000_000),
+        (1_000_000_000, 1_350_000_000),
+        (1_450_000_000, 1_950_000_000),
+    ]
+''',
+)
+replace_once("src/provision-wrapper.py", '"h2", "1100000000-1100001000"', '"h2", "600000000-600001000"')
+replace_once("src/provision-wrapper.py", '"h3", "2100000000-2100001000"', '"h3", "1100000000-1100001000"')
+replace_once("src/provision-wrapper.py", '"h4", "3100000000-3100001000"', '"h4", "1600000000-1600001000"')
+replace_once(
+    "src/provision-wrapper.py",
+    '''    h2 1100000000-1100001000
+    h3 2100000000-2100001000
+    h4 3100000000-3100001000''',
+    '''    h2 600000000-600001000
+    h3 1100000000-1100001000
+    h4 1600000000-1600001000''',
+)
+# PersistentKeepalive is an AWG 3 range; write it on both peer configs.
+replace_once(
+    "src/provision-wrapper.py",
+    '''    if endpoint:
+        lines += [
+            f"Endpoint = {endpoint}",
+            f"PersistentKeepalive = {params['PersistentKeepalive']}",
+        ]
+    return "\\n".join(lines) + "\\n"
+''',
+    '''    if endpoint:
+        lines.append(f"Endpoint = {endpoint}")
+    lines.append(f"PersistentKeepalive = {params['PersistentKeepalive']}")
+    return "\\n".join(lines) + "\\n"
+''',
+)
+
+# Core install must upgrade an existing old AWG package, not only detect binaries.
+replace_once(
+    "lib/install-core.sh",
+    '''install_amneziawg(){
+    command -v awg >/dev/null 2>&1 && command -v awg-quick >/dev/null 2>&1 && return 0
+
+''',
+    '''install_amneziawg(){
+''',
+)
+replace_once(
+    "lib/install-core.sh",
+    'msg "Устанавливаю AmneziaWG..." "Installing AmneziaWG..."\n',
+    'msg "Устанавливаю или обновляю AmneziaWG..." "Installing or updating AmneziaWG..."\n',
+)
+
+# CLI presentation.
+replace_once(
+    "src/cli.py",
+    '''        agent = n.get("agent") or {}
+        print(
+            f"    {n.get('public_ip') or '—'} {awg.get('interface') or '—'} "
+            f"hs={awg.get('handshake_age_sec')}s rtt={c.get('tunnel_rtt_ms')}ms "
+            f"TG={'OK' if c.get('telegram') else 'FAIL'} "
+            f"Agent={'OK' if agent.get('reachable') else 'OFF'} "
+            f"fails={n.get('fail_count', 0)}"
+        )
+''',
+    '''        agent = n.get("agent") or {}
+        transport = n.get("transport") or {}
+        target = c.get("telegram_target") or "—"
+        hpk = "HPK" if transport.get("header_protection") else "no-HPK"
+        print(
+            f"    {n.get('public_ip') or '—'} {awg.get('interface') or '—'} "
+            f"transport={transport.get('profile') or 'legacy'}/{hpk} "
+            f"hs={awg.get('handshake_age_sec')}s rtt={c.get('tunnel_rtt_ms')}ms "
+            f"TG={'OK' if c.get('telegram') else 'FAIL'}({target}) "
+            f"Agent={'OK' if agent.get('reachable') else 'OFF'} "
+            f"fails={n.get('fail_count', 0)}"
+        )
+''',
+)
+
+# Panel job runner.
+replace_once(
+    "panel/job-runner.py",
+    '''def public_action(action: str) -> tuple[str, str]:
+    if action == "add": return "add", "Добавление EXIT-ноды"
+    if action == "remove": return "remove", "Удаление EXIT-ноды"
+    raise ValueError("action must be add/remove")
+''',
+    '''def public_action(action: str) -> tuple[str, str]:
+    if action == "add": return "add", "Добавление EXIT-ноды"
+    if action == "remove": return "remove", "Удаление EXIT-ноды"
+    if action == "upgrade": return "upgrade", "Обновление транспорта EXIT-ноды до AWG 3.1"
+    raise ValueError("action must be add/remove/upgrade")
+''',
+)
+replace_once(
+    "panel/job-runner.py",
+    '    write_job(job_id,state="running",stage="provisioning" if action=="add" else "removing",message="Настройка EXIT-ноды" if action=="add" else "Удаление EXIT-ноды")\n',
+    '    stages={"add":("provisioning","Настройка EXIT-ноды"),"remove":("removing","Удаление EXIT-ноды"),"upgrade":("transport","Обновление AWG-транспорта")}\n    stage,message=stages.get(action,("running","Выполнение операции"))\n    write_job(job_id,state="running",stage=stage,message=message)\n',
+)
+
+# Panel backend route.
+backend_anchor = '\tmux.Handle("POST /api/egress/nodes/{node}/remove", protected(func(w http.ResponseWriter, r *http.Request) {\n'
+backend_route = '''\tmux.Handle("POST /api/egress/nodes/{node}/transport", protected(func(w http.ResponseWriter, r *http.Request) {
+\t\tnode := r.PathValue("node")
+\t\tif !validNodeRef(node) { writeError(w, http.StatusBadRequest, "invalid_node", "Некорректная нода"); return }
+\t\tvar req struct { Auth egressSSHAuthRequest `json:"auth"` }
+\t\tif err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&req); err != nil { writeError(w, http.StatusBadRequest, "bad_request", "Некорректные параметры обновления транспорта"); return }
+\t\tif err := validateEgressSSHAuth(req.Auth); err != nil { writeError(w, http.StatusBadRequest, "invalid_auth", err.Error()); return }
+\t\tpayload := map[string]any{"action":"upgrade", "node":node, "auth":map[string]any{"mode":req.Auth.Mode,"secret":req.Auth.Secret}}
+\t\traw, _ := json.Marshal(payload); out, err := runEgressBridgeInput(r.Context(), raw, "job-start")
+\t\tif err != nil { writeError(w, http.StatusBadGateway, "egress_transport_start_failed", err.Error()); return }
+\t\twriteEgressJSON(w, out)
+\t}))
+
+'''
+replace_once("panel/backend/egress.go", backend_anchor, backend_route + backend_anchor)
+
+# Panel API types.
+replace_once(
+    "panel/frontend/api.fragment.ts",
+    '''  awg: { interface: string; up: boolean; handshake_age_sec: number; rx_bytes?: number; tx_bytes?: number; };
+  connectivity: { tunnel?: boolean; tunnel_rtt_ms?: number | null; telegram: boolean; telegram_tcp_ms?: number | null; routing?: boolean; nftables?: boolean; };
+''',
+    '''  awg: { interface: string; up: boolean; handshake_age_sec: number; rx_bytes?: number; tx_bytes?: number; };
+  transport?: { profile?: string; header_protection?: boolean; mtu?: number; updated_at?: string | null; };
+  connectivity: { tunnel?: boolean; tunnel_rtt_ms?: number | null; telegram: boolean; telegram_tcp_ms?: number | null; telegram_target?: string | null; telegram_ip?: string | null; telegram_probes_tried?: number; telegram_probe_total?: number; routing?: boolean; nftables?: boolean; };
+''',
+)
+replace_once(
+    "panel/frontend/api.fragment.ts",
+    "export interface EgressRemoveNodeRequest { remote_cleanup: boolean; fallback: 'block' | 'direct'; auth: EgressSSHAuth; }\n",
+    "export interface EgressRemoveNodeRequest { remote_cleanup: boolean; fallback: 'block' | 'direct'; auth: EgressSSHAuth; }\nexport interface EgressTransportUpgradeRequest { auth: EgressSSHAuth; }\n",
+)
+replace_once(
+    "panel/frontend/api.fragment.ts",
+    "export interface EgressJob { id: string; action: 'add' | 'remove'; label?: string; state: EgressJobState;",
+    "export interface EgressJob { id: string; action: 'add' | 'remove' | 'upgrade'; label?: string; state: EgressJobState;",
+)
+replace_once(
+    "panel/frontend/api.fragment.ts",
+    '''  removeNode: (node: string, payload: EgressRemoveNodeRequest) => request<EgressJob>(EGRESS_BASE, `/nodes/${encodeURIComponent(node)}/remove`, { method: 'POST', body: JSON.stringify(payload) }),
+''',
+    '''  removeNode: (node: string, payload: EgressRemoveNodeRequest) => request<EgressJob>(EGRESS_BASE, `/nodes/${encodeURIComponent(node)}/remove`, { method: 'POST', body: JSON.stringify(payload) }),
+  upgradeTransport: (node: string, payload: EgressTransportUpgradeRequest) => request<EgressJob>(EGRESS_BASE, `/nodes/${encodeURIComponent(node)}/transport`, { method: 'POST', body: JSON.stringify(payload) }),
+''',
+)
+
+# Panel page.
+replace_once(
+    "panel/frontend/EgressPage.tsx",
+    '''  type EgressRemoveNodeRequest,
+  type EgressSSHAuthMode,
+''',
+    '''  type EgressRemoveNodeRequest,
+  type EgressTransportUpgradeRequest,
+  type EgressSSHAuthMode,
+''',
+)
+replace_once(
+    "panel/frontend/EgressPage.tsx",
+    "function NodeCard({ node, active, busy, onSwitch, onTest, onToggle, onPriority, onRename, onRemove }: {\n",
+    "function NodeCard({ node, active, busy, onSwitch, onTest, onToggle, onPriority, onRename, onUpgrade, onRemove }: {\n",
+)
+replace_once(
+    "panel/frontend/EgressPage.tsx",
+    '''  onRename: (name: string) => void;
+  onRemove: () => void;
+''',
+    '''  onRename: (name: string) => void;
+  onUpgrade: () => void;
+  onRemove: () => void;
+''',
+)
+replace_once(
+    "panel/frontend/EgressPage.tsx",
+    '''      <div><div className="text-xs text-text-secondary">AWG</div><div>{node.awg?.up ? 'UP' : 'DOWN'}</div></div>
+      <div><div className="text-xs text-text-secondary">Tunnel RTT</div><div>{c.tunnel_rtt_ms != null ? `${c.tunnel_rtt_ms} ms` : '—'}</div></div>
+      <div><div className="text-xs text-text-secondary">Telegram</div><div>{c.telegram ? 'OK' : 'FAIL'}</div></div>
+''',
+    '''      <div><div className="text-xs text-text-secondary">AWG</div><div>{node.awg?.up ? 'UP' : 'DOWN'}</div><div className="text-xs text-text-secondary">{node.transport?.profile || 'legacy'} · {node.transport?.header_protection ? 'HPK ON' : 'HPK OFF'}</div></div>
+      <div><div className="text-xs text-text-secondary">Tunnel RTT</div><div>{c.tunnel_rtt_ms != null ? `${c.tunnel_rtt_ms} ms` : '—'}</div></div>
+      <div><div className="text-xs text-text-secondary">Telegram</div><div>{c.telegram ? `OK · ${c.telegram_target || 'DC'}` : 'FAIL'}</div></div>
+''',
+)
+replace_once(
+    "panel/frontend/EgressPage.tsx",
+    '''        <Button size="sm" variant={node.enabled ? 'danger' : 'outline'} disabled={busy} onClick={onToggle}>{node.enabled ? 'Disable from AUTO' : 'Enable node'}</Button>
+        <Button size="sm" variant="danger" disabled={busy} onClick={onRemove}>Remove…</Button>
+''',
+    '''        <Button size="sm" variant={node.enabled ? 'danger' : 'outline'} disabled={busy} onClick={onToggle}>{node.enabled ? 'Disable from AUTO' : 'Enable node'}</Button>
+        <Button size="sm" variant="outline" disabled={busy} onClick={onUpgrade}>Upgrade AWG 3.1…</Button>
+        <Button size="sm" variant="danger" disabled={busy} onClick={onRemove}>Remove…</Button>
+''',
+)
+upgrade_component = '''function UpgradeTransport({ node, busy, onCancel, onUpgrade }: {
+  node: EgressNodeStatus;
+  busy: boolean;
+  onCancel: () => void;
+  onUpgrade: (r: EgressTransportUpgradeRequest) => void;
+}) {
+  const [mode, setMode] = useState<EgressSSHAuthMode>('auto');
+  const [secret, setSecret] = useState('');
+  const submit = () => {
+    if (mode !== 'auto' && !secret) return;
+    onUpgrade({ auth: { mode, secret: mode === 'auto' ? undefined : secret } });
+    setSecret('');
+  };
+  return <Card className="p-4 space-y-4">
+    <div><div className="font-medium text-text-primary">Upgrade transport: {node.name}</div><div className="text-xs text-text-secondary mt-1">Rotates the AWG key pair and UDP port, installs/updates AWG 3.1 on both sides, writes the full obfuscation profile, verifies Telegram through the tunnel, and rolls back both configs if validation fails.</div></div>
+    <AuthFields mode={mode} secret={secret} onMode={(v) => { setMode(v); setSecret(''); }} onSecret={setSecret} />
+    <div className="flex gap-2"><Button size="sm" disabled={busy} onClick={submit}>Upgrade to AWG 3.1</Button><Button size="sm" variant="outline" disabled={busy} onClick={onCancel}>Cancel</Button></div>
+  </Card>;
+}
+
+'''
+replace_once("panel/frontend/EgressPage.tsx", "export function EgressPage() {\n", upgrade_component + "export function EgressPage() {\n")
+replace_once(
+    "panel/frontend/EgressPage.tsx",
+    '''  const [addOpen, setAddOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+''',
+    '''  const [addOpen, setAddOpen] = useState(false);
+  const [upgradeTarget, setUpgradeTarget] = useState<EgressNodeStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+''',
+)
+replace_once(
+    "panel/frontend/EgressPage.tsx",
+    '''  const startAdd = async (r: EgressAddNodeRequest) => { setBusy(true); try { setJob(await egressApi.addNode(r)); setAddOpen(false); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); } };
+''',
+    '''  const startAdd = async (r: EgressAddNodeRequest) => { setBusy(true); try { setJob(await egressApi.addNode(r)); setAddOpen(false); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); } };
+  const startUpgrade = async (node: EgressNodeStatus, r: EgressTransportUpgradeRequest) => { setBusy(true); try { setJob(await egressApi.upgradeTransport(node.id, r)); setUpgradeTarget(null); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); } };
+''',
+)
+replace_once(
+    "panel/frontend/EgressPage.tsx",
+    '''      {addOpen && <AddNode busy={busy || Boolean(jobBusy)} suggestedPriority={suggestedPriority} onCancel={() => setAddOpen(false)} onAdd={(r) => void startAdd(r)} />}
+      <div className="grid grid-cols-1 2xl:grid-cols-2 gap-4">{nodes.map((n) => <NodeCard key={n.id} node={n} active={status?.active_node === n.id} busy={busy || Boolean(jobBusy)} onSwitch={() => void setMode('manual', n.id)} onTest={() => void mutate(() => egressApi.testNode(n.id))} onToggle={() => void mutate(() => egressApi.setNodeEnabled(n.id, !n.enabled))} onPriority={(p) => void mutate(() => egressApi.setNodePriority(n.id, p))} onRename={(name) => void mutate(() => egressApi.renameNode(n.id, name))} onRemove={() => void removeNode(n)} />)}</div>
+''',
+    '''      {addOpen && <AddNode busy={busy || Boolean(jobBusy)} suggestedPriority={suggestedPriority} onCancel={() => setAddOpen(false)} onAdd={(r) => void startAdd(r)} />}
+      {upgradeTarget && <UpgradeTransport node={upgradeTarget} busy={busy || Boolean(jobBusy)} onCancel={() => setUpgradeTarget(null)} onUpgrade={(r) => void startUpgrade(upgradeTarget, r)} />}
+      <div className="grid grid-cols-1 2xl:grid-cols-2 gap-4">{nodes.map((n) => <NodeCard key={n.id} node={n} active={status?.active_node === n.id} busy={busy || Boolean(jobBusy)} onSwitch={() => void setMode('manual', n.id)} onTest={() => void mutate(() => egressApi.testNode(n.id))} onToggle={() => void mutate(() => egressApi.setNodeEnabled(n.id, !n.enabled))} onPriority={(p) => void mutate(() => egressApi.setNodePriority(n.id, p))} onRename={(name) => void mutate(() => egressApi.renameNode(n.id, name))} onUpgrade={() => setUpgradeTarget(n)} onRemove={() => void removeNode(n)} />)}</div>
+''',
+)
+
+# README note.
+p = Path("README.md")
+s = p.read_text()
+if "## AWG 3.1 transport" not in s:
+    note = '''## AWG 3.1 transport
+
+EgressMT uses a full randomized AWG 3.1 profile for new and upgraded egress tunnels: Jc/Jmin/Jmax, S1-S4, non-overlapping H1-H4 ranges, I1-I5 signature packets, content padding, custom timing ranges, ranged PersistentKeepalive and MTU 1280. HeaderProtectionKey is enabled only when both installed kernel modules accept it at runtime. Telegram health is multi-DC: ICMP is diagnostic only, and a node is usable when its AWG handshake is fresh and at least one Telegram DC TCP probe succeeds; Telemt DC coverage remains the post-switch authority.
+
+'''
+    idx = s.find("## ")
+    p.write_text(s[:idx] + note + s[idx:] if idx >= 0 else s.rstrip() + "\n\n" + note)
+
+print("AWG 3.1 migration patch applied")
