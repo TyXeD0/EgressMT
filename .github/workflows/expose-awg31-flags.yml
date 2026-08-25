@@ -1,0 +1,93 @@
+name: Expose AWG 3.1 transport flags
+
+on:
+  push:
+    paths:
+      - '.github/workflows/expose-awg31-flags.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Persist and expose full AWG 3.1 flags
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str, label: str) -> None:
+              p = Path(path)
+              s = p.read_text()
+              if old not in s:
+                  raise SystemExit(f'{path}: {label} anchor not found')
+              p.write_text(s.replace(old, new, 1))
+
+          # Provisioner registry persistence and add/upgrade metadata.
+          replace_once('src/provision.py',
+              '''        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),\n        ("transport_updated_at", q(n.get("transport_updated_at", ""))),''',
+              '''        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),\n        ("random_trailers", "true" if bool(n.get("random_trailers", False)) else "false"),\n        ("disable_cookies", "true" if bool(n.get("disable_cookies", False)) else "false"),\n        ("transport_updated_at", q(n.get("transport_updated_at", ""))),''',
+              'render transport fields')
+
+          old = '''        n["header_protection"] = bool(params.get("HeaderProtection", False))\n        n["transport_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())'''
+          new = '''        n["header_protection"] = bool(params.get("HeaderProtection", False))\n        n["random_trailers"] = bool(params.get("RandomTrailers", False))\n        n["disable_cookies"] = bool(params.get("DisableCookies", False))\n        n["transport_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())'''
+          p = Path('src/provision.py'); s = p.read_text()
+          count = s.count(old)
+          if count != 2:
+              raise SystemExit(f'src/provision.py: expected 2 transport assignment anchors, found {count}')
+          p.write_text(s.replace(old, new))
+
+          replace_once('src/provision.py',
+              '''event(f"node_transport_upgrade id={node_id} profile={n['transport_profile']} hpk={1 if n['header_protection'] else 0}")''',
+              '''event(f"node_transport_upgrade id={node_id} profile={n['transport_profile']} hpk={1 if n['header_protection'] else 0} rt={1 if n.get('random_trailers') else 0} nocookie={1 if n.get('disable_cookies') else 0}")''',
+              'upgrade event')
+
+          # Daemon persistence and status payload.
+          replace_once('src/egressd.py',
+              '''        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),\n        ("transport_updated_at", q(n.get("transport_updated_at", ""))),''',
+              '''        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),\n        ("random_trailers", "true" if bool(n.get("random_trailers", False)) else "false"),\n        ("disable_cookies", "true" if bool(n.get("disable_cookies", False)) else "false"),\n        ("transport_updated_at", q(n.get("transport_updated_at", ""))),''',
+              'daemon render transport fields')
+
+          p = Path('src/egressd.py'); s = p.read_text()
+          old = '''            "profile": str(n.get("transport_profile", "legacy")),\n            "header_protection": bool(n.get("header_protection", False)),\n            "mtu": int(n.get("transport_mtu", 0) or 0),'''
+          new = '''            "profile": str(n.get("transport_profile", "legacy")),\n            "header_protection": bool(n.get("header_protection", False)),\n            "random_trailers": bool(n.get("random_trailers", False)),\n            "disable_cookies": bool(n.get("disable_cookies", False)),\n            "mtu": int(n.get("transport_mtu", 0) or 0),'''
+          count = s.count(old)
+          if count != 2:
+              raise SystemExit(f'src/egressd.py: expected 2 status transport anchors, found {count}')
+          p.write_text(s.replace(old, new))
+
+          # CLI: make old full-profile nodes visibly distinguishable from the new flags.
+          replace_once('src/cli.py',
+              '''        hpk = "HPK" if transport.get("header_protection") else "no-HPK"\n        print(''',
+              '''        hpk = "HPK" if transport.get("header_protection") else "no-HPK"\n        rt = "RT" if transport.get("random_trailers") else "no-RT"\n        cookies = "no-cookie" if transport.get("disable_cookies") else "cookies"\n        print(''',
+              'cli flag variables')
+          replace_once('src/cli.py',
+              '''f"transport={transport.get('profile') or 'legacy'}/{hpk} "''',
+              '''f"transport={transport.get('profile') or 'legacy'}/{hpk}/{rt}/{cookies} "''',
+              'cli transport format')
+
+          # Panel can read the additive JSON fields without changing the generated API contract.
+          replace_once('panel/frontend/EgressPage.tsx',
+              '''  const c = node.connectivity || {};\n  const a = node.agent || { reachable: false };''',
+              '''  const c = node.connectivity || {};\n  const a = node.agent || { reachable: false };\n  const tr = node.transport as (typeof node.transport & { random_trailers?: boolean; disable_cookies?: boolean });''',
+              'panel transport cast')
+          replace_once('panel/frontend/EgressPage.tsx',
+              '''<div className="text-xs text-text-secondary">{node.transport?.profile || 'legacy'} · {node.transport?.header_protection ? 'HPK ON' : 'HPK OFF'}</div>''',
+              '''<div className="text-xs text-text-secondary">{node.transport?.profile || 'legacy'} · {node.transport?.header_protection ? 'HPK ON' : 'HPK OFF'} · {tr?.random_trailers ? 'RT ON' : 'RT OFF'} · {tr?.disable_cookies ? 'COOKIES OFF' : 'COOKIES ON'}</div>''',
+              'panel transport badges')
+          PY
+
+          python3 -m py_compile src/provision.py src/egressd.py src/cli.py
+          git diff --check
+          grep -q 'random_trailers' src/provision.py
+          grep -q 'disable_cookies' src/egressd.py
+          grep -q 'no-cookie' src/cli.py
+          grep -q 'RT ON' panel/frontend/EgressPage.tsx
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+TyXeD0@users.noreply.github.com'
+          git add src/provision.py src/egressd.py src/cli.py panel/frontend/EgressPage.tsx
+          git commit -m 'Expose complete AWG 3.1 transport state'
+          git push
