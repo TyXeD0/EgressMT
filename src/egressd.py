@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import datetime as dt
 import fcntl
+import http.client
 import ipaddress
 import json
 import os
@@ -356,18 +357,24 @@ def health_node(n: dict[str, Any], handshake_max_age: int) -> dict[str, Any]:
 
 
 def agent_node(n: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Query the private node-agent strictly through this node tunnel."""
     token_path = Path(str(n.get("agent_token_file", "")))
     if not token_path.is_file():
         return {"reachable": False, "error": "token_missing"}, None
+    conn: http.client.HTTPConnection | None = None
     try:
         token = token_path.read_text(encoding="utf-8").strip()
-        req = urllib.request.Request(
-            f"http://{n['remote_tunnel_ip']}:{int(n.get('agent_port', 9784))}/metrics",
-            headers={"Authorization": "Bearer " + token},
-        )
+        host = str(n["remote_tunnel_ip"])
+        port = int(n.get("agent_port", 9784))
+        local = str(n["local_tunnel_ip"])
         started = time.monotonic()
-        with urllib.request.urlopen(req, timeout=2.5) as r:
-            data = json.loads(r.read())
+        conn = http.client.HTTPConnection(host, port, timeout=2.5, source_address=(local, 0))
+        conn.request("GET", "/metrics", headers={"Authorization": "Bearer " + token})
+        response = conn.getresponse()
+        raw = response.read()
+        if response.status != 200:
+            raise RuntimeError(f"node-agent HTTP {response.status}")
+        data = json.loads(raw)
         agent = {
             "reachable": True,
             "request_ms": round((time.monotonic() - started) * 1000, 1),
@@ -378,7 +385,10 @@ def agent_node(n: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None
         return agent, system
     except Exception as exc:
         return {"reachable": False, "error": type(exc).__name__}, None
-
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
 
 def telemt_nat_ip(config_path: Path) -> str:
     try:
