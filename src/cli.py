@@ -92,9 +92,11 @@ def human_status(d: dict) -> None:
         transport = n.get("transport") or {}
         target = c.get("telegram_target") or "—"
         hpk = "HPK" if transport.get("header_protection") else "no-HPK"
+        rt = "RT" if transport.get("random_trailers") else "no-RT"
+        cookies = "no-cookie" if transport.get("disable_cookies") else "cookies"
         print(
             f"    {n.get('public_ip') or '—'} {awg.get('interface') or '—'} "
-            f"transport={transport.get('profile') or 'legacy'}/{hpk} "
+            f"transport={transport.get('profile') or 'legacy'}/{hpk}/{rt}/{cookies} "
             f"hs={awg.get('handshake_age_sec')}s rtt={c.get('tunnel_rtt_ms')}ms "
             f"TG={'OK' if c.get('telegram') else 'FAIL'}({target}) "
             f"Agent={'OK' if agent.get('reachable') else 'OFF'} "

@@ -121,6 +121,8 @@ def render_node(n: dict[str, Any]) -> str:
         ("transport_profile", q(n.get("transport_profile", "legacy"))),
         ("transport_mtu", str(int(n.get("transport_mtu", 0) or 0))),
         ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),
+        ("random_trailers", "true" if bool(n.get("random_trailers", False)) else "false"),
+        ("disable_cookies", "true" if bool(n.get("disable_cookies", False)) else "false"),
         ("transport_updated_at", q(n.get("transport_updated_at", ""))),
         ("provisioned", "true" if bool(n.get("provisioned", True)) else "false"),
     ]
@@ -512,6 +514,8 @@ def add_node(req: dict[str, Any]) -> dict[str, Any]:
         n["transport_profile"] = str(params.get("Profile", "legacy"))
         n["transport_mtu"] = int(params.get("MTU", 0) or 0)
         n["header_protection"] = bool(params.get("HeaderProtection", False))
+        n["random_trailers"] = bool(params.get("RandomTrailers", False))
+        n["disable_cookies"] = bool(params.get("DisableCookies", False))
         n["transport_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         local_text=config_text(private=local_priv,address=n["local_tunnel_ip"],peer_public=remote_pub,allowed_cidr="0.0.0.0/0",params=params,endpoint=f"{host}:{n['awg_port']}")
         remote_text=config_text(private=remote_priv,address=n["remote_tunnel_ip"],peer_public=local_pub,allowed_cidr=f"{n['local_tunnel_ip']}/32",params=params,listen=int(n["awg_port"]))
@@ -583,7 +587,7 @@ def upgrade_node(req: dict[str, Any]) -> dict[str, Any]:
         remote_priv=ssh.exec("umask 077; awg genkey").strip(); remote_pub=ssh.exec(f"printf '%s\\n' {shlex.quote(remote_priv)} | awg pubkey").strip()
         params=awg_params(); n["awg_port"]=new_port
         n["transport_profile"]=str(params.get("Profile","legacy")); n["transport_mtu"]=int(params.get("MTU",0) or 0)
-        n["header_protection"]=bool(params.get("HeaderProtection",False)); n["transport_updated_at"]=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
+        n["header_protection"]=bool(params.get("HeaderProtection",False)); n["random_trailers"]=bool(params.get("RandomTrailers",False)); n["disable_cookies"]=bool(params.get("DisableCookies",False)); n["transport_updated_at"]=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
         endpoint=str(n.get("endpoint") or n.get("ssh_host") or n.get("public_ip"))
         local_text=config_text(private=local_priv,address=n["local_tunnel_ip"],peer_public=remote_pub,allowed_cidr="0.0.0.0/0",params=params,endpoint=f"{endpoint}:{new_port}")
         remote_text=config_text(private=remote_priv,address=n["remote_tunnel_ip"],peer_public=local_pub,allowed_cidr=f"{n['local_tunnel_ip']}/32",params=params,listen=new_port)
@@ -607,7 +611,7 @@ def upgrade_node(req: dict[str, Any]) -> dict[str, Any]:
         if old_mode=="manual" and old_manual==node_id and was_enabled: control({"action":"set_mode","mode":"manual","node":node_id})
         test=control({"action":"node_test","node":node_id}) if was_enabled else {"health":True}
         if was_enabled and not test.get("health"): fail("upgraded node did not become healthy")
-        event(f"node_transport_upgrade id={node_id} profile={n['transport_profile']} hpk={1 if n['header_protection'] else 0}")
+        event(f"node_transport_upgrade id={node_id} profile={n['transport_profile']} hpk={1 if n['header_protection'] else 0} rt={1 if n.get('random_trailers') else 0} nocookie={1 if n.get('disable_cookies') else 0}")
         return {"id":node_id,"name":n["name"],"transport_profile":n["transport_profile"],"header_protection":n["header_protection"],"port":new_port,"tunnel_rtt_ms":rtt,"telegram_tcp_ms":tg_ms,"telegram_target":tg_target,"health":bool(test.get("health",True)),"backup":str(local_backup)}
     except Exception:
         with contextlib.suppress(Exception): atomic_write(NODES_DIR/f"{node_id}.toml",render_node(original),0o600)

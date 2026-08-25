@@ -60,6 +60,7 @@ function NodeCard({ node, active, busy, onSwitch, onTest, onToggle, onPriority, 
   useEffect(() => setPriority(String(node.priority)), [node.priority]);
   const c = node.connectivity || {};
   const a = node.agent || { reachable: false };
+  const tr = node.transport as (typeof node.transport & { random_trailers?: boolean; disable_cookies?: boolean });
   return <Card className="p-4 space-y-3">
     <div className="flex items-start justify-between gap-3">
       <div>
@@ -73,7 +74,7 @@ function NodeCard({ node, active, busy, onSwitch, onTest, onToggle, onPriority, 
       <Badge variant={!node.enabled ? 'warning' : node.health ? 'success' : 'danger'}>{!node.enabled ? 'DISABLED' : node.health ? 'HEALTHY' : 'DOWN'}</Badge>
     </div>
     <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
-      <div><div className="text-xs text-text-secondary">AWG</div><div>{node.awg?.up ? 'UP' : 'DOWN'}</div><div className="text-xs text-text-secondary">{node.transport?.profile || 'legacy'} · {node.transport?.header_protection ? 'HPK ON' : 'HPK OFF'}</div></div>
+      <div><div className="text-xs text-text-secondary">AWG</div><div>{node.awg?.up ? 'UP' : 'DOWN'}</div><div className="text-xs text-text-secondary">{node.transport?.profile || 'legacy'} · {node.transport?.header_protection ? 'HPK ON' : 'HPK OFF'} · {tr?.random_trailers ? 'RT ON' : 'RT OFF'} · {tr?.disable_cookies ? 'COOKIES OFF' : 'COOKIES ON'}</div></div>
       <div><div className="text-xs text-text-secondary">Tunnel RTT</div><div>{c.tunnel_rtt_ms != null ? `${c.tunnel_rtt_ms} ms` : '—'}</div></div>
       <div><div className="text-xs text-text-secondary">Telegram</div><div>{c.telegram ? `OK · ${c.telegram_target || 'DC'}` : 'FAIL'}</div></div>
       <div><div className="text-xs text-text-secondary">Agent</div><div>{a.reachable ? 'ONLINE' : 'OFFLINE'}</div></div>

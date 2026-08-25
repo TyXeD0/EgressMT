@@ -343,6 +343,8 @@ def health_node(n: dict[str, Any], handshake_max_age: int) -> dict[str, Any]:
         "transport": {
             "profile": str(n.get("transport_profile", "legacy")),
             "header_protection": bool(n.get("header_protection", False)),
+            "random_trailers": bool(n.get("random_trailers", False)),
+            "disable_cookies": bool(n.get("disable_cookies", False)),
             "mtu": int(n.get("transport_mtu", 0) or 0),
             "updated_at": str(n.get("transport_updated_at", "")) or None,
         },
@@ -499,6 +501,8 @@ def render_node(n: dict[str, Any]) -> str:
         ("transport_profile", q(n.get("transport_profile", "legacy"))),
         ("transport_mtu", str(int(n.get("transport_mtu", 0) or 0))),
         ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),
+        ("random_trailers", "true" if bool(n.get("random_trailers", False)) else "false"),
+        ("disable_cookies", "true" if bool(n.get("disable_cookies", False)) else "false"),
         ("transport_updated_at", q(n.get("transport_updated_at", ""))),
         ("provisioned", "true" if bool(n.get("provisioned", True)) else "false"),
     ]
@@ -622,6 +626,8 @@ class Manager:
                         "transport": {
                             "profile": str(n.get("transport_profile", "legacy")),
                             "header_protection": bool(n.get("header_protection", False)),
+            "random_trailers": bool(n.get("random_trailers", False)),
+            "disable_cookies": bool(n.get("disable_cookies", False)),
                             "mtu": int(n.get("transport_mtu", 0) or 0),
                             "updated_at": str(n.get("transport_updated_at", "")) or None,
                         },
