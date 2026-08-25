@@ -1,0 +1,60 @@
+name: Fix APT normalizer syntax
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-apt-normalizer-syntax.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Replace nested Python normalizer with awk
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def fix(path: str) -> None:
+              p = Path(path)
+              s = p.read_text()
+              pat = re.compile(r'''(?ms)^([ \t]*)python3 - "\$src" "\$needle" <<'PY2'\n.*?^PY2$''')
+
+              def repl(m: re.Match[str]) -> str:
+                  i = m.group(1)
+                  return "\n".join([
+                      i + 'tmp="$(mktemp)"',
+                      i + 'awk -v needle="$needle" \'BEGIN { RS=""; ORS=sprintf("%c%c",10,10) } index($0, needle)==0 { print }\' "$src" >"$tmp"',
+                      i + 'if [[ -s "$tmp" ]]; then',
+                      i + '    cat "$tmp" >"$src"',
+                      i + 'else',
+                      i + '    rm -f "$src"',
+                      i + 'fi',
+                      i + 'rm -f "$tmp"',
+                  ])
+
+              s2, count = pat.subn(repl, s)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected exactly one broken PY2 normalizer, found {count}')
+              p.write_text(s2)
+
+          fix('lib/install-core.sh')
+          fix('src/provision-wrapper.py')
+          PY
+
+          bash -n lib/install-core.sh
+          python3 -m py_compile src/provision-wrapper.py
+
+          # Ensure the generated remote bash body itself contains no nested PY2 block anymore.
+          ! grep -q "<<'PY2'" lib/install-core.sh
+          ! grep -q "<<'PY2'" src/provision-wrapper.py
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add lib/install-core.sh src/provision-wrapper.py
+          git commit -m 'Fix APT source normalizer syntax' || exit 0
+          git push
