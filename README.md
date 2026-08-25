@@ -58,9 +58,9 @@ The installer also has a separate **compatibility check** menu item. Telemt itse
 
 ## How it works
 
-EgressMT uses **priority-based failover**, not traffic balancing. Egress tunnels stay up continuously. Health checks cover AmneziaWG, the private tunnel and a real Telegram TCP connection. Only Telegram IPv4 ranges are policy-routed through the selected egress; unrelated traffic from the entry VPS keeps its normal route.
+EgressMT uses **priority-based failover**, not traffic balancing. Egress tunnels stay up continuously. A node is considered transport-healthy when its AmneziaWG interface is up, its handshake is fresh and a TCP connection through that tunnel succeeds to at least one target in the rotating Telegram multi-DC probe pool. Tunnel ICMP/RTT and the node agent are diagnostic signals and do not by themselves make an otherwise working Telegram path unhealthy. Only Telegram IPv4 ranges are policy-routed through the selected egress; unrelated traffic from the entry VPS keeps its normal route.
 
-Telemt's `middle_proxy_nat_ip` is synchronized with the public IPv4 of the active egress node and DC writers are verified after every switch.
+After a route switch, Telemt's own DC writers and coverage are the final readiness check. Telemt's `middle_proxy_nat_ip` is synchronized with the public IPv4 of the active egress node and DC writers are verified after every switch.
 
 A pre-Docker boot guard installs a fail-closed route before Telemt can start. After boot, EgressMT reconstructs the persisted active egress route before normal Telegram forwarding is allowed.
 
