@@ -107,21 +107,14 @@ normalize_amnezia_sources() {
     [[ -f "$src" ]] || continue
     grep -Fqs "$needle" "$src" || continue
     if [[ "$src" == *.sources ]]; then
-      python3 - "$src" "$needle" <<'PY2'
-from pathlib import Path
-import re,sys
-p=Path(sys.argv[1]); needle=sys.argv[2]
-text=p.read_text(encoding='utf-8',errors='replace')
-stanzas=[x for x in re.split(r'
-[ 	]*
-',text.strip()) if x.strip()]
-keep=[x for x in stanzas if needle not in x]
-if keep: p.write_text('
-
-'.join(keep)+'
-',encoding='utf-8')
-else: p.unlink()
-PY2
+      tmp="$(mktemp)"
+      awk -v needle="$needle" 'BEGIN { RS=""; ORS=sprintf("%c%c",10,10) } index($0, needle)==0 { print }' "$src" >"$tmp"
+      if [[ -s "$tmp" ]]; then
+          cat "$tmp" >"$src"
+      else
+          rm -f "$src"
+      fi
+      rm -f "$tmp"
     else
       sed -i "\|$needle|d" "$src"
       [[ -s "$src" ]] || rm -f "$src"
