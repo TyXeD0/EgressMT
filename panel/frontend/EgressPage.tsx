@@ -13,6 +13,7 @@ import {
   type EgressMode,
   type EgressNodeStatus,
   type EgressRemoveNodeRequest,
+  type EgressTransportUpgradeRequest,
   type EgressSSHAuthMode,
   type EgressStatus,
 } from '@/lib/api';
@@ -40,7 +41,7 @@ function AuthFields({ mode, secret, onMode, onSecret }: {
   </div>;
 }
 
-function NodeCard({ node, active, busy, onSwitch, onTest, onToggle, onPriority, onRename, onRemove }: {
+function NodeCard({ node, active, busy, onSwitch, onTest, onToggle, onPriority, onRename, onUpgrade, onRemove }: {
   node: EgressNodeStatus;
   active: boolean;
   busy: boolean;
@@ -49,6 +50,7 @@ function NodeCard({ node, active, busy, onSwitch, onTest, onToggle, onPriority, 
   onToggle: () => void;
   onPriority: (p: number) => void;
   onRename: (name: string) => void;
+  onUpgrade: () => void;
   onRemove: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -71,9 +73,9 @@ function NodeCard({ node, active, busy, onSwitch, onTest, onToggle, onPriority, 
       <Badge variant={!node.enabled ? 'warning' : node.health ? 'success' : 'danger'}>{!node.enabled ? 'DISABLED' : node.health ? 'HEALTHY' : 'DOWN'}</Badge>
     </div>
     <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
-      <div><div className="text-xs text-text-secondary">AWG</div><div>{node.awg?.up ? 'UP' : 'DOWN'}</div></div>
+      <div><div className="text-xs text-text-secondary">AWG</div><div>{node.awg?.up ? 'UP' : 'DOWN'}</div><div className="text-xs text-text-secondary">{node.transport?.profile || 'legacy'} · {node.transport?.header_protection ? 'HPK ON' : 'HPK OFF'}</div></div>
       <div><div className="text-xs text-text-secondary">Tunnel RTT</div><div>{c.tunnel_rtt_ms != null ? `${c.tunnel_rtt_ms} ms` : '—'}</div></div>
-      <div><div className="text-xs text-text-secondary">Telegram</div><div>{c.telegram ? 'OK' : 'FAIL'}</div></div>
+      <div><div className="text-xs text-text-secondary">Telegram</div><div>{c.telegram ? `OK · ${c.telegram_target || 'DC'}` : 'FAIL'}</div></div>
       <div><div className="text-xs text-text-secondary">Agent</div><div>{a.reachable ? 'ONLINE' : 'OFFLINE'}</div></div>
     </div>
     <div className="flex flex-wrap gap-2">
@@ -88,6 +90,7 @@ function NodeCard({ node, active, busy, onSwitch, onTest, onToggle, onPriority, 
       </div>
       <div className="flex flex-wrap gap-2">
         <Button size="sm" variant={node.enabled ? 'danger' : 'outline'} disabled={busy} onClick={onToggle}>{node.enabled ? 'Disable from AUTO' : 'Enable node'}</Button>
+        <Button size="sm" variant="outline" disabled={busy} onClick={onUpgrade}>Upgrade AWG 3.1…</Button>
         <Button size="sm" variant="danger" disabled={busy} onClick={onRemove}>Remove…</Button>
       </div>
     </div>}
@@ -126,12 +129,33 @@ function AddNode({ busy, suggestedPriority, onCancel, onAdd }: {
   </Card>;
 }
 
+function UpgradeTransport({ node, busy, onCancel, onUpgrade }: {
+  node: EgressNodeStatus;
+  busy: boolean;
+  onCancel: () => void;
+  onUpgrade: (r: EgressTransportUpgradeRequest) => void;
+}) {
+  const [mode, setMode] = useState<EgressSSHAuthMode>('auto');
+  const [secret, setSecret] = useState('');
+  const submit = () => {
+    if (mode !== 'auto' && !secret) return;
+    onUpgrade({ auth: { mode, secret: mode === 'auto' ? undefined : secret } });
+    setSecret('');
+  };
+  return <Card className="p-4 space-y-4">
+    <div><div className="font-medium text-text-primary">Upgrade transport: {node.name}</div><div className="text-xs text-text-secondary mt-1">Rotates the AWG key pair and UDP port, installs/updates AWG 3.1 on both sides, writes the full obfuscation profile, verifies Telegram through the tunnel, and rolls back both configs if validation fails.</div></div>
+    <AuthFields mode={mode} secret={secret} onMode={(v) => { setMode(v); setSecret(''); }} onSecret={setSecret} />
+    <div className="flex gap-2"><Button size="sm" disabled={busy} onClick={submit}>Upgrade to AWG 3.1</Button><Button size="sm" variant="outline" disabled={busy} onClick={onCancel}>Cancel</Button></div>
+  </Card>;
+}
+
 export function EgressPage() {
   const [status, setStatus] = useState<EgressStatus | null>(null);
   const [config, setConfig] = useState<EgressConfig | null>(null);
   const [events, setEvents] = useState<string[]>([]);
   const [job, setJob] = useState<EgressJob | null>(null);
   const [addOpen, setAddOpen] = useState(false);
+  const [upgradeTarget, setUpgradeTarget] = useState<EgressNodeStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -156,6 +180,7 @@ export function EgressPage() {
   const mutate = async (fn: () => Promise<unknown>) => { setBusy(true); try { await fn(); await load(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); } };
   const setMode = async (mode: EgressMode, node?: string) => { if (mode === 'direct' && !window.confirm('DIRECT sends Telegram traffic through the entry VPS. Continue?')) return; if (mode === 'block' && !window.confirm('BLOCK stops Telegram traffic. Continue?')) return; await mutate(() => egressApi.setMode(mode, node)); };
   const startAdd = async (r: EgressAddNodeRequest) => { setBusy(true); try { setJob(await egressApi.addNode(r)); setAddOpen(false); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); } };
+  const startUpgrade = async (node: EgressNodeStatus, r: EgressTransportUpgradeRequest) => { setBusy(true); try { setJob(await egressApi.upgradeTransport(node.id, r)); setUpgradeTarget(null); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); } };
   const removeNode = async (node: EgressNodeStatus) => {
     if (!window.confirm(`Remove egress node "${node.name}" from the entry VPS?`)) return;
     const remote = window.confirm('Also remove EgressMT components from the remote egress VPS? Cancel = remove only from the entry VPS.');
@@ -172,7 +197,8 @@ export function EgressPage() {
       {status && <Card className="p-4 space-y-3"><div className="flex flex-wrap justify-between gap-3"><div><div className="font-medium">Mode: {status.mode.toUpperCase()}</div><div className="text-xs text-text-secondary">Active: {nodes.find((n) => n.id === status.active_node)?.name || status.active_node || '—'} · writers {status.telemt?.alive_writers ?? '—'}/{status.telemt?.required_writers ?? '—'} · coverage {status.telemt?.dc_coverage_pct ?? '—'}%</div></div><Badge variant={status.active_node === 'block' ? 'danger' : status.phase === 'running' ? 'success' : 'warning'}>{status.phase || 'unknown'}</Badge></div><div className="flex gap-2"><Button size="sm" variant={status.mode === 'auto' ? 'default' : 'outline'} disabled={busy || jobBusy} onClick={() => void setMode('auto')}>AUTO</Button><Button size="sm" variant="outline" disabled={busy || jobBusy} onClick={() => void setMode('direct')}>DIRECT</Button><Button size="sm" variant="danger" disabled={busy || jobBusy} onClick={() => void setMode('block')}>BLOCK</Button></div></Card>}
       <div className="flex justify-between items-center"><div className="font-medium">Egress nodes: {nodes.length}</div><Button size="sm" variant="outline" disabled={busy || jobBusy} onClick={() => setAddOpen(true)}>+ Add node</Button></div>
       {addOpen && <AddNode busy={busy || Boolean(jobBusy)} suggestedPriority={suggestedPriority} onCancel={() => setAddOpen(false)} onAdd={(r) => void startAdd(r)} />}
-      <div className="grid grid-cols-1 2xl:grid-cols-2 gap-4">{nodes.map((n) => <NodeCard key={n.id} node={n} active={status?.active_node === n.id} busy={busy || Boolean(jobBusy)} onSwitch={() => void setMode('manual', n.id)} onTest={() => void mutate(() => egressApi.testNode(n.id))} onToggle={() => void mutate(() => egressApi.setNodeEnabled(n.id, !n.enabled))} onPriority={(p) => void mutate(() => egressApi.setNodePriority(n.id, p))} onRename={(name) => void mutate(() => egressApi.renameNode(n.id, name))} onRemove={() => void removeNode(n)} />)}</div>
+      {upgradeTarget && <UpgradeTransport node={upgradeTarget} busy={busy || Boolean(jobBusy)} onCancel={() => setUpgradeTarget(null)} onUpgrade={(r) => void startUpgrade(upgradeTarget, r)} />}
+      <div className="grid grid-cols-1 2xl:grid-cols-2 gap-4">{nodes.map((n) => <NodeCard key={n.id} node={n} active={status?.active_node === n.id} busy={busy || Boolean(jobBusy)} onSwitch={() => void setMode('manual', n.id)} onTest={() => void mutate(() => egressApi.testNode(n.id))} onToggle={() => void mutate(() => egressApi.setNodeEnabled(n.id, !n.enabled))} onPriority={(p) => void mutate(() => egressApi.setNodePriority(n.id, p))} onRename={(name) => void mutate(() => egressApi.renameNode(n.id, name))} onUpgrade={() => setUpgradeTarget(n)} onRemove={() => void removeNode(n)} />)}</div>
       {config && <Card className="p-4 space-y-3"><div className="font-medium">Failover settings</div><div className="text-xs text-text-secondary">Check interval: {config.check_interval}s · failures: {config.fail_threshold} · failback hold: {config.failback_hold}s · handshake age: {config.handshake_max_age}s</div></Card>}
       <Card className="p-4"><div className="font-medium mb-2">Events</div><div className="space-y-1 font-mono text-xs text-text-secondary">{[...events].reverse().map((e, i) => <div key={`${i}-${e}`} className="break-all">{e}</div>)}</div></Card>
     </div>

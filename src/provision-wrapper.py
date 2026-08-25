@@ -30,9 +30,9 @@ def _probe_args(iface: str, key_path: str, hpk_path: str | None = None) -> list[
         "jc", "4", "jmin", "32", "jmax", "96",
         "s1", "32", "s2", "32", "s3", "32", "s4", "32",
         "h1", "100000000-100001000",
-        "h2", "1100000000-1100001000",
-        "h3", "2100000000-2100001000",
-        "h4", "3100000000-3100001000",
+        "h2", "600000000-600001000",
+        "h3", "1100000000-1100001000",
+        "h4", "1600000000-1600001000",
         "i1", "<r 8><rc 8><t>",
         "i2", "<rd 12><r 8>",
         "i3", "<rc 16><r 8>",
@@ -107,8 +107,7 @@ APT=(apt-get -o DPkg::Lock::Timeout=120)
   ca-certificates curl gnupg iproute2 nftables python3 dkms \
   "linux-headers-$(uname -r)" >/dev/null
 
-if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
-  FPR="75C9DD72C799870E310542E24166F2C257290828"
+FPR="75C9DD72C799870E310542E24166F2C257290828"
   KEYRING="/usr/share/keyrings/amnezia-archive-keyring.gpg"
   SOURCE="/etc/apt/sources.list.d/amnezia-ppa.sources"
   KEY="$(mktemp /tmp/egressmt-amnezia-key.XXXXXX)"
@@ -150,8 +149,7 @@ EOF
     exit 75
   }
 
-  "${APT[@]}" install -y amneziawg amneziawg-tools >/dev/null
-fi
+"${APT[@]}" install -y amneziawg amneziawg-tools >/dev/null
 
 command -v awg >/dev/null
 command -v awg-quick >/dev/null
@@ -170,9 +168,9 @@ probe_awg31() {
     jc 4 jmin 32 jmax 96
     s1 32 s2 32 s3 32 s4 32
     h1 100000000-100001000
-    h2 1100000000-1100001000
-    h3 2100000000-2100001000
-    h4 3100000000-3100001000
+    h2 600000000-600001000
+    h3 1100000000-1100001000
+    h4 1600000000-1600001000
     i1 '<r 8><rc 8><t>'
     i2 '<rd 12><r 8>'
     i3 '<rc 16><r 8>'
@@ -214,10 +212,10 @@ ip -4 route show default | awk 'NR==1{print $5}'
 def _header_ranges(r: random.SystemRandom) -> list[str]:
     # Separate 32-bit windows guarantee that the four ranges can never overlap.
     windows = [
-        (100_000_000, 850_000_000),
-        (1_000_000_000, 1_750_000_000),
-        (1_900_000_000, 2_650_000_000),
-        (2_800_000_000, 3_950_000_000),
+        (100_000_000, 450_000_000),
+        (550_000_000, 900_000_000),
+        (1_000_000_000, 1_350_000_000),
+        (1_450_000_000, 1_950_000_000),
     ]
     result: list[str] = []
     for lo, hi in windows:
@@ -314,10 +312,8 @@ def config_text(*, private: str, address: str, peer_public: str, allowed_cidr: s
         f"AllowedIPs = {allowed_cidr}",
     ]
     if endpoint:
-        lines += [
-            f"Endpoint = {endpoint}",
-            f"PersistentKeepalive = {params['PersistentKeepalive']}",
-        ]
+        lines.append(f"Endpoint = {endpoint}")
+    lines.append(f"PersistentKeepalive = {params['PersistentKeepalive']}")
     return "\n".join(lines) + "\n"
 
 

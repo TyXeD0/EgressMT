@@ -56,7 +56,8 @@ def write_job(job_id: str, **changes: Any) -> dict[str, Any]:
 def public_action(action: str) -> tuple[str, str]:
     if action == "add": return "add", "Добавление EXIT-ноды"
     if action == "remove": return "remove", "Удаление EXIT-ноды"
-    raise ValueError("action must be add/remove")
+    if action == "upgrade": return "upgrade", "Обновление транспорта EXIT-ноды до AWG 3.1"
+    raise ValueError("action must be add/remove/upgrade")
 
 
 def start_job() -> None:
@@ -81,7 +82,9 @@ def run_job(job_id: str, request_path: Path) -> None:
         try: request_path.unlink()
         except FileNotFoundError: pass
     action = str(request.get("action") or "")
-    write_job(job_id,state="running",stage="provisioning" if action=="add" else "removing",message="Настройка EXIT-ноды" if action=="add" else "Удаление EXIT-ноды")
+    stages={"add":("provisioning","Настройка EXIT-ноды"),"remove":("removing","Удаление EXIT-ноды"),"upgrade":("transport","Обновление AWG-транспорта")}
+    stage,message=stages.get(action,("running","Выполнение операции"))
+    write_job(job_id,state="running",stage=stage,message=message)
     if not PROVISIONER.is_file() or not os.access(PROVISIONER,os.X_OK): raise RuntimeError("EXIT provisioner is not installed")
     raw=json.dumps(request,ensure_ascii=False); request.clear()
     env={"PATH":"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","LANG":"C.UTF-8","HOME":"/root"}

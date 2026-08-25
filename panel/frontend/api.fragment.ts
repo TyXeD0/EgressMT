@@ -21,7 +21,8 @@ export interface EgressNodeStatus {
   health: boolean;
   fail_count?: number;
   awg: { interface: string; up: boolean; handshake_age_sec: number; rx_bytes?: number; tx_bytes?: number; };
-  connectivity: { tunnel?: boolean; tunnel_rtt_ms?: number | null; telegram: boolean; telegram_tcp_ms?: number | null; routing?: boolean; nftables?: boolean; };
+  transport?: { profile?: string; header_protection?: boolean; mtu?: number; updated_at?: string | null; };
+  connectivity: { tunnel?: boolean; tunnel_rtt_ms?: number | null; telegram: boolean; telegram_tcp_ms?: number | null; telegram_target?: string | null; telegram_ip?: string | null; telegram_probes_tried?: number; telegram_probe_total?: number; routing?: boolean; nftables?: boolean; };
   agent?: EgressAgentStatus;
   system?: EgressSystemStatus | null;
 }
@@ -32,8 +33,9 @@ export interface EgressConfig { check_interval: number; fail_threshold: number; 
 export interface EgressSSHAuth { mode: EgressSSHAuthMode; secret?: string; }
 export interface EgressAddNodeRequest { name: string; host: string; port: number; user: string; priority?: number; auth: EgressSSHAuth; }
 export interface EgressRemoveNodeRequest { remote_cleanup: boolean; fallback: 'block' | 'direct'; auth: EgressSSHAuth; }
+export interface EgressTransportUpgradeRequest { auth: EgressSSHAuth; }
 export interface EgressProvisionerStatus { ok: boolean; version: string; nodes: number; active?: string | null; }
-export interface EgressJob { id: string; action: 'add' | 'remove'; label?: string; state: EgressJobState; stage?: string; message?: string; created_at?: number; updated_at?: number; finished_at?: number | null; result?: Record<string, unknown> | null; error?: string | null; }
+export interface EgressJob { id: string; action: 'add' | 'remove' | 'upgrade'; label?: string; state: EgressJobState; stage?: string; message?: string; created_at?: number; updated_at?: number; finished_at?: number | null; result?: Record<string, unknown> | null; error?: string | null; }
 
 const EGRESS_BASE = `${BASE}/api/egress`;
 
@@ -47,6 +49,7 @@ export const egressApi = {
   provisioner: () => request<EgressProvisionerStatus>(EGRESS_BASE, '/provisioner'),
   addNode: (payload: EgressAddNodeRequest) => request<EgressJob>(EGRESS_BASE, '/nodes', { method: 'POST', body: JSON.stringify(payload) }),
   removeNode: (node: string, payload: EgressRemoveNodeRequest) => request<EgressJob>(EGRESS_BASE, `/nodes/${encodeURIComponent(node)}/remove`, { method: 'POST', body: JSON.stringify(payload) }),
+  upgradeTransport: (node: string, payload: EgressTransportUpgradeRequest) => request<EgressJob>(EGRESS_BASE, `/nodes/${encodeURIComponent(node)}/transport`, { method: 'POST', body: JSON.stringify(payload) }),
   job: (job: string) => request<EgressJob>(EGRESS_BASE, `/jobs/${encodeURIComponent(job)}`),
   config: () => request<EgressConfig>(EGRESS_BASE, '/config'),
   saveConfig: (config: EgressConfig) => request<EgressConfig>(EGRESS_BASE, '/config', { method: 'PUT', body: JSON.stringify(config) }),

@@ -18,6 +18,10 @@ ENTRY VPS
 
 EgressMT does **not** assume a country, provider, public IP range, node name or fixed number of nodes.
 
+## AWG 3.1 transport
+
+EgressMT uses a full randomized AWG 3.1 profile for new and upgraded egress tunnels: Jc/Jmin/Jmax, S1-S4, non-overlapping H1-H4 ranges, I1-I5 signature packets, content padding, custom timing ranges, ranged PersistentKeepalive and MTU 1280. HeaderProtectionKey is enabled only when both installed kernel modules accept it at runtime. Telegram health is multi-DC: ICMP is diagnostic only, and a node is usable when its AWG handshake is fresh and at least one Telegram DC TCP probe succeeds; Telemt DC coverage remains the post-switch authority.
+
 ## Status
 
 **v0.1.0-rc1 — pre-release.** The failover core has been validated on real VPS infrastructure, including entry-host reboot, backup-node reboot, active-node failover/failback and fail-closed operation. A final clean-install validation from this repository is required before the first stable release.

@@ -89,10 +89,14 @@ def human_status(d: dict) -> None:
         awg = n.get("awg") or {}
         c = n.get("connectivity") or {}
         agent = n.get("agent") or {}
+        transport = n.get("transport") or {}
+        target = c.get("telegram_target") or "—"
+        hpk = "HPK" if transport.get("header_protection") else "no-HPK"
         print(
             f"    {n.get('public_ip') or '—'} {awg.get('interface') or '—'} "
+            f"transport={transport.get('profile') or 'legacy'}/{hpk} "
             f"hs={awg.get('handshake_age_sec')}s rtt={c.get('tunnel_rtt_ms')}ms "
-            f"TG={'OK' if c.get('telegram') else 'FAIL'} "
+            f"TG={'OK' if c.get('telegram') else 'FAIL'}({target}) "
             f"Agent={'OK' if agent.get('reachable') else 'OFF'} "
             f"fails={n.get('fail_count', 0)}"
         )

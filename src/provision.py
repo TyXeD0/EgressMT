@@ -34,8 +34,14 @@ SOCKET = "/run/mtproxyl-egress/control.sock"
 AGENT_SOURCE = Path("/usr/local/libexec/mtproxyl-node-agent-source")
 REGISTRY = Path("/usr/local/libexec/mtproxyl-egress-registry")
 AGENT_PORT = 9784
-TEST_TELEGRAM_IP = "149.154.167.51"
-TEST_TELEGRAM_PORT = 443
+TELEGRAM_PROBES = [
+    ("dc1", "149.154.175.50"),
+    ("dc2", "149.154.167.51"),
+    ("dc3", "149.154.175.100"),
+    ("dc4", "149.154.167.91"),
+    ("dc5", "91.108.56.151"),
+]
+TELEGRAM_PROBE_PORT = 443
 REMOTE_OWNER_DIR = "/etc/egressmt-node"
 REMOTE_OWNER = REMOTE_OWNER_DIR + "/owner.json"
 TG4 = [
@@ -112,6 +118,10 @@ def render_node(n: dict[str, Any]) -> str:
         ("local_tunnel_ip", q(n["local_tunnel_ip"])), ("remote_tunnel_ip", q(n["remote_tunnel_ip"])),
         ("routing_table", str(int(n["routing_table"]))), ("agent_port", str(int(n.get("agent_port", AGENT_PORT)))),
         ("agent_token_file", q(n.get("agent_token_file", ""))),
+        ("transport_profile", q(n.get("transport_profile", "legacy"))),
+        ("transport_mtu", str(int(n.get("transport_mtu", 0) or 0))),
+        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),
+        ("transport_updated_at", q(n.get("transport_updated_at", ""))),
         ("provisioned", "true" if bool(n.get("provisioned", True)) else "false"),
     ]
     return "\n".join(f"{k} = {v}" for k, v in fields) + "\n"
@@ -426,7 +436,7 @@ def candidate_route_up(n: dict[str, Any]) -> None:
     run(["ip","route","replace","blackhole","default","metric","32760","table",table])
     run(["ip","route","replace","default","dev",iface,"src",local,"metric","10","table",table])
     run(["ip","rule","add","priority",str(prio),"from",f"{local}/32","lookup",table])
-    p=run(["ip","route","get",TEST_TELEGRAM_IP,"from",local,"mark","0x200000"],check=False)
+    p=run(["ip","route","get",TELEGRAM_PROBES[0][1],"from",local,"mark","0x200000"],check=False)
     if p.returncode != 0 or f"dev {iface}" not in p.stdout:
         candidate_route_down(n, flush=True); fail("candidate Telegram probe is not routed through new AWG interface")
 
@@ -447,20 +457,29 @@ def local_cleanup(n: dict[str, Any]) -> None:
         with contextlib.suppress(FileNotFoundError): token.unlink()
 
 
-def ping_tunnel(iface: str, remote: str, timeout_sec: int=30) -> float:
-    deadline=time.monotonic()+timeout_sec; last=""
+def ping_tunnel(iface: str, remote: str, timeout_sec: int=5) -> float | None:
+    """Best-effort ICMP diagnostic; Telegram reachability is authoritative."""
+    deadline=time.monotonic()+timeout_sec
     while time.monotonic()<deadline:
-        p=run(["ping","-I",iface,"-c","1","-W","1",remote],check=False,timeout=3); last=p.stderr or p.stdout
+        p=run(["ping","-I",iface,"-c","1","-W","1",remote],check=False,timeout=3)
         if p.returncode==0:
             m=re.search(r"time[=<]([0-9.]+)\s*ms",p.stdout); return float(m.group(1)) if m else 0.0
-        time.sleep(1)
-    fail("AWG tunnel ping failed: "+last.strip())
+        time.sleep(0.5)
+    return None
 
 
-def telegram_tcp(local_ip: str) -> float:
-    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(5); started=time.monotonic()
-    try: s.bind((local_ip,0)); s.connect((TEST_TELEGRAM_IP,TEST_TELEGRAM_PORT)); return round((time.monotonic()-started)*1000,1)
-    finally: s.close()
+def telegram_tcp(local_ip: str) -> tuple[float, str]:
+    errors: list[str] = []
+    for label, host in TELEGRAM_PROBES:
+        s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(4); started=time.monotonic()
+        try:
+            s.bind((local_ip,0)); s.connect((host,TELEGRAM_PROBE_PORT))
+            return round((time.monotonic()-started)*1000,1), label
+        except OSError as exc:
+            errors.append(f"{label}:{type(exc).__name__}")
+        finally:
+            s.close()
+    fail("Telegram TCP failed for all probe DCs: "+", ".join(errors))
 
 
 def agent_check(n: dict[str, Any], token: str) -> None:
@@ -490,6 +509,10 @@ def add_node(req: dict[str, Any]) -> dict[str, Any]:
         ext=remote_packages(ssh); n["public_ip"]=remote_public_ip(ssh)
         local_priv=run(["awg","genkey"]).stdout.strip(); local_pub=run(["awg","pubkey"],input_text=local_priv+"\n").stdout.strip()
         remote_priv=ssh.exec("umask 077; awg genkey").strip(); remote_pub=ssh.exec(f"printf '%s\\n' {shlex.quote(remote_priv)} | awg pubkey").strip(); params=awg_params()
+        n["transport_profile"] = str(params.get("Profile", "legacy"))
+        n["transport_mtu"] = int(params.get("MTU", 0) or 0)
+        n["header_protection"] = bool(params.get("HeaderProtection", False))
+        n["transport_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         local_text=config_text(private=local_priv,address=n["local_tunnel_ip"],peer_public=remote_pub,allowed_cidr="0.0.0.0/0",params=params,endpoint=f"{host}:{n['awg_port']}")
         remote_text=config_text(private=remote_priv,address=n["remote_tunnel_ip"],peer_public=local_pub,allowed_cidr=f"{n['local_tunnel_ip']}/32",params=params,listen=int(n["awg_port"]))
         remote_write(ssh,f"/etc/amnezia/amneziawg/{n['awg_interface']}.conf",remote_text,0o600)
@@ -499,7 +522,7 @@ def add_node(req: dict[str, Any]) -> dict[str, Any]:
         run(["systemctl","daemon-reload"]); run(["systemctl","enable","--now",local_unit]); run(["systemctl","is-active","--quiet",local_unit]); run(["ip","link","show","dev",str(n["awg_interface"])]); run(["awg","show",str(n["awg_interface"])])
         remote_firewall(ssh,n,ext); remote_agent(ssh,n,token)
         rtt=ping_tunnel(str(n["awg_interface"]),str(n["remote_tunnel_ip"])); candidate_route_up(n)
-        try: tg_ms=telegram_tcp(str(n["local_tunnel_ip"]))
+        try: tg_ms,tg_target=telegram_tcp(str(n["local_tunnel_ip"]))
         finally: candidate_route_down(n,flush=False)
         agent_check(n,token)
         TOKENS_DIR.mkdir(parents=True,exist_ok=True); atomic_write(Path(str(n["agent_token_file"])),token+"\n",0o600)
@@ -507,7 +530,7 @@ def add_node(req: dict[str, Any]) -> dict[str, Any]:
         run([str(REGISTRY),"validate"]); control({"action":"reload"}); time.sleep(1); test=control({"action":"node_test","node":str(n["id"])})
         if not test.get("health"): fail("node registered but dynamic health check is DOWN")
         event(f"node_add id={n['id']} name={name!r} priority={n['priority']}")
-        return {"id":n["id"],"name":n["name"],"public_ip":n["public_ip"],"priority":n["priority"],"interface":n["awg_interface"],"tunnel_rtt_ms":rtt,"telegram_tcp_ms":tg_ms,"health":True}
+        return {"id":n["id"],"name":n["name"],"public_ip":n["public_ip"],"priority":n["priority"],"interface":n["awg_interface"],"transport_profile":n.get("transport_profile"),"header_protection":n.get("header_protection",False),"tunnel_rtt_ms":rtt,"telegram_tcp_ms":tg_ms,"telegram_target":tg_target,"health":True}
     except Exception:
         if registered:
             with contextlib.suppress(FileNotFoundError): (NODES_DIR/f"{n['id']}.toml").unlink()
@@ -517,6 +540,90 @@ def add_node(req: dict[str, Any]) -> dict[str, Any]:
             with contextlib.suppress(Exception): remote_cleanup(ssh,str(n["id"]),str(n["awg_interface"]))
         raise
     finally: ssh.close()
+
+
+
+def _restore_control_after_transport(node_id: str, was_enabled: bool, old_mode: str, old_manual: str | None) -> None:
+    if was_enabled:
+        with contextlib.suppress(Exception): control({"action":"node_enable","node":node_id})
+    if old_mode == "manual" and old_manual == node_id and was_enabled:
+        with contextlib.suppress(Exception): control({"action":"set_mode","mode":"manual","node":node_id})
+
+
+def upgrade_node(req: dict[str, Any]) -> dict[str, Any]:
+    """Transactionally rotate keys/port and migrate a managed node to current AWG."""
+    n=find_node(str(req.get("node") or "")); node_id=str(n["id"]); iface=str(n["awg_interface"])
+    auth=dict(req.get("auth") or {})
+    ssh=SSH(str(n.get("ssh_host") or n.get("public_ip")),int(n.get("ssh_port",22)),str(n.get("ssh_user","root")),auth)
+    local_cfg=Path("/etc/amnezia/amneziawg")/f"{iface}.conf"; remote_cfg=f"/etc/amnezia/amneziawg/{iface}.conf"
+    if not local_cfg.is_file():
+        ssh.close(); fail("local AWG config is missing")
+    old_local=local_cfg.read_text(encoding="utf-8"); old_remote=""; remote_backed=False; local_changed=False; remote_changed=False
+    original=dict(n); original.pop("_path",None)
+    status=control({"action":"status"}); old_mode=str(status.get("mode") or "auto"); old_manual=status.get("manual_node")
+    was_enabled=bool(n.get("enabled",True))
+    stamp=time.strftime("%Y%m%d-%H%M%S",time.gmtime())
+    local_backup=STATE_DIR/"transport-backups"/f"{node_id}-{stamp}.conf"
+    remote_backup=f"/etc/egressmt-node/backups/{node_id}-{stamp}.conf"
+    try:
+        if ssh.exec("id -u").strip()!="0": fail("SSH user must be root")
+        if not remote_marker_matches(ssh,node_id,iface): fail("remote ownership marker mismatch")
+        old_remote=ssh.exec(f"cat {shlex.quote(remote_cfg)}")+"\n"
+        local_backup.parent.mkdir(parents=True,exist_ok=True); atomic_write(local_backup,old_local,0o600)
+        remote_write(ssh,remote_backup,old_remote,0o600); remote_backed=True
+
+        if old_mode=="manual" and old_manual==node_id:
+            control({"action":"set_mode","mode":"auto"})
+        if was_enabled:
+            control({"action":"node_disable","node":node_id}); wait_not_active(node_id)
+
+        remote_packages(ssh); n["public_ip"]=remote_public_ip(ssh)
+        new_port=random.SystemRandom().randint(20000,59999)
+        local_priv=run(["awg","genkey"]).stdout.strip(); local_pub=run(["awg","pubkey"],input_text=local_priv+"\n").stdout.strip()
+        remote_priv=ssh.exec("umask 077; awg genkey").strip(); remote_pub=ssh.exec(f"printf '%s\\n' {shlex.quote(remote_priv)} | awg pubkey").strip()
+        params=awg_params(); n["awg_port"]=new_port
+        n["transport_profile"]=str(params.get("Profile","legacy")); n["transport_mtu"]=int(params.get("MTU",0) or 0)
+        n["header_protection"]=bool(params.get("HeaderProtection",False)); n["transport_updated_at"]=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
+        endpoint=str(n.get("endpoint") or n.get("ssh_host") or n.get("public_ip"))
+        local_text=config_text(private=local_priv,address=n["local_tunnel_ip"],peer_public=remote_pub,allowed_cidr="0.0.0.0/0",params=params,endpoint=f"{endpoint}:{new_port}")
+        remote_text=config_text(private=remote_priv,address=n["remote_tunnel_ip"],peer_public=local_pub,allowed_cidr=f"{n['local_tunnel_ip']}/32",params=params,listen=new_port)
+
+        remote_write(ssh,remote_cfg,remote_text,0o600); remote_changed=True
+        remote_unit=f"awg-quick@{iface}.service"
+        ssh.exec(f"systemctl restart {shlex.quote(remote_unit)}; systemctl is-active --quiet {shlex.quote(remote_unit)}; awg show {shlex.quote(iface)} >/dev/null")
+        atomic_write(local_cfg,local_text,0o600); local_changed=True
+        local_unit=f"awg-quick@{iface}.service"
+        run(["systemctl","restart",local_unit]); run(["systemctl","is-active","--quiet",local_unit])
+
+        rtt=ping_tunnel(iface,str(n["remote_tunnel_ip"])); candidate_route_up(n)
+        try: tg_ms,tg_target=telegram_tcp(str(n["local_tunnel_ip"]))
+        finally: candidate_route_down(n,flush=False)
+        token_path=Path(str(n.get("agent_token_file", "")))
+        if not token_path.is_file(): fail("node-agent token is missing")
+        agent_check(n,token_path.read_text(encoding="utf-8").strip())
+
+        atomic_write(NODES_DIR/f"{node_id}.toml",render_node(n),0o600); run([str(REGISTRY),"validate"]); control({"action":"reload"})
+        if was_enabled: control({"action":"node_enable","node":node_id})
+        if old_mode=="manual" and old_manual==node_id and was_enabled: control({"action":"set_mode","mode":"manual","node":node_id})
+        test=control({"action":"node_test","node":node_id}) if was_enabled else {"health":True}
+        if was_enabled and not test.get("health"): fail("upgraded node did not become healthy")
+        event(f"node_transport_upgrade id={node_id} profile={n['transport_profile']} hpk={1 if n['header_protection'] else 0}")
+        return {"id":node_id,"name":n["name"],"transport_profile":n["transport_profile"],"header_protection":n["header_protection"],"port":new_port,"tunnel_rtt_ms":rtt,"telegram_tcp_ms":tg_ms,"telegram_target":tg_target,"health":bool(test.get("health",True)),"backup":str(local_backup)}
+    except Exception:
+        with contextlib.suppress(Exception): atomic_write(NODES_DIR/f"{node_id}.toml",render_node(original),0o600)
+        if remote_changed and remote_backed and old_remote:
+            with contextlib.suppress(Exception):
+                remote_write(ssh,remote_cfg,old_remote,0o600)
+                ssh.exec(f"systemctl restart {shlex.quote('awg-quick@'+iface+'.service')}")
+        if local_changed:
+            with contextlib.suppress(Exception):
+                atomic_write(local_cfg,old_local,0o600); run(["systemctl","restart",f"awg-quick@{iface}.service"],check=False)
+        with contextlib.suppress(Exception): run([str(REGISTRY),"validate"])
+        with contextlib.suppress(Exception): control({"action":"reload"})
+        _restore_control_after_transport(node_id,was_enabled,old_mode,str(old_manual) if old_manual else None)
+        raise
+    finally:
+        ssh.close()
 
 
 def wait_not_active(node_id: str, timeout: int=45) -> None:
@@ -567,6 +674,7 @@ def locked_call(action: str, req: dict[str, Any]) -> dict[str, Any]:
         except BlockingIOError: fail("another add/remove operation is already running")
         if action=="add": return add_node(req)
         if action=="remove": return remove_node(req)
+        if action=="upgrade": return upgrade_node(req)
         fail("unknown action")
 
 
@@ -577,7 +685,7 @@ def main() -> None:
     if args.cmd=="preflight": print(json.dumps(preflight(),ensure_ascii=False,indent=2)); return
     if args.cmd=="request":
         req=json.load(sys.stdin); action=str(req.get("action") or "")
-        if action not in {"add","remove"}: fail("request action must be add/remove")
+        if action not in {"add","remove","upgrade"}: fail("request action must be add/remove/upgrade")
         print(json.dumps(locked_call(action,req),ensure_ascii=False,indent=2 if args.pretty else None)); return
     ap.print_help()
 

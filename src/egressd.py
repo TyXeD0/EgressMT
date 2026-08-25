@@ -36,8 +36,14 @@ EVENTS_FILE = STATE_DIR / "events.log"
 SOCKET_PATH = Path("/run/mtproxyl-egress/control.sock")
 LOCK_PATH = Path("/run/mtproxyl-egress/daemon.lock")
 
-TEST_TELEGRAM_IP = "149.154.167.51"
-TEST_TELEGRAM_PORT = 443
+TELEGRAM_PROBES = [
+    ("dc1", "149.154.175.50"),
+    ("dc2", "149.154.167.51"),
+    ("dc3", "149.154.175.100"),
+    ("dc4", "149.154.167.91"),
+    ("dc5", "91.108.56.151"),
+]
+TELEGRAM_PROBE_PORT = 443
 PROBE_RULE_START = 10800
 PROBE_RULE_END = 10899
 TEMP_RULE_PRIORITY = 10999
@@ -284,18 +290,33 @@ def ping_node(n: dict[str, Any]) -> tuple[bool, float | None]:
     return True, float(m.group(1)) if m else None
 
 
-def tcp_node(n: dict[str, Any]) -> tuple[bool, float | None]:
+def _tcp_probe(local_ip: str, host: str, timeout: float = 2.5) -> tuple[bool, float | None]:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(2.5)
+    s.settimeout(timeout)
     started = time.monotonic()
     try:
-        s.bind((str(n["local_tunnel_ip"]), 0))
-        s.connect((TEST_TELEGRAM_IP, TEST_TELEGRAM_PORT))
+        s.bind((local_ip, 0))
+        s.connect((host, TELEGRAM_PROBE_PORT))
         return True, round((time.monotonic() - started) * 1000, 1)
     except OSError:
         return False, None
     finally:
         s.close()
+
+
+def telegram_node(n: dict[str, Any]) -> tuple[bool, float | None, str | None, str | None, int]:
+    """Probe Telegram through a node; any reachable Telegram DC is sufficient."""
+    local = str(n["local_tunnel_ip"])
+    seed = sum(str(n.get("id", "")).encode()) + int(time.time() // 60)
+    start = seed % len(TELEGRAM_PROBES)
+    ordered = TELEGRAM_PROBES[start:] + TELEGRAM_PROBES[:start]
+    attempts = 0
+    for label, host in ordered:
+        attempts += 1
+        ok, ms = _tcp_probe(local, host)
+        if ok:
+            return True, ms, label, host, attempts
+    return False, None, None, None, attempts
 
 
 def health_node(n: dict[str, Any], handshake_max_age: int) -> dict[str, Any]:
@@ -305,7 +326,7 @@ def health_node(n: dict[str, Any], handshake_max_age: int) -> dict[str, Any]:
     rx, tx = awg_transfer(iface) if iface_up else (0, 0)
     hs_ok = iface_up and 0 <= age <= handshake_max_age
     ping_ok, rtt = ping_node(n) if iface_up else (False, None)
-    tg_ok, tg_ms = tcp_node(n) if ping_ok else (False, None)
+    tg_ok, tg_ms, tg_label, tg_ip, tg_attempts = telegram_node(n) if iface_up else (False, None, None, None, 0)
     enabled = bool(n.get("enabled", True))
     return {
         "id": str(n["id"]),
@@ -313,14 +334,23 @@ def health_node(n: dict[str, Any], handshake_max_age: int) -> dict[str, Any]:
         "enabled": enabled,
         "priority": int(n["priority"]),
         "public_ip": str(n.get("public_ip", "")),
-        "health": enabled and hs_ok and ping_ok and tg_ok,
+        "health": enabled and hs_ok and tg_ok,
         "awg": {
             "interface": iface, "up": iface_up, "handshake_age_sec": age,
             "rx_bytes": rx, "tx_bytes": tx,
         },
+        "transport": {
+            "profile": str(n.get("transport_profile", "legacy")),
+            "header_protection": bool(n.get("header_protection", False)),
+            "mtu": int(n.get("transport_mtu", 0) or 0),
+            "updated_at": str(n.get("transport_updated_at", "")) or None,
+        },
         "connectivity": {
             "tunnel": ping_ok, "tunnel_rtt_ms": rtt,
             "telegram": tg_ok, "telegram_tcp_ms": tg_ms,
+            "telegram_target": tg_label, "telegram_ip": tg_ip,
+            "telegram_probes_tried": tg_attempts,
+            "telegram_probe_total": len(TELEGRAM_PROBES),
         },
     }
 
@@ -456,6 +486,10 @@ def render_node(n: dict[str, Any]) -> str:
         ("routing_table", str(int(n["routing_table"]))),
         ("agent_port", str(int(n.get("agent_port", 9784)))),
         ("agent_token_file", q(n.get("agent_token_file", ""))),
+        ("transport_profile", q(n.get("transport_profile", "legacy"))),
+        ("transport_mtu", str(int(n.get("transport_mtu", 0) or 0))),
+        ("header_protection", "true" if bool(n.get("header_protection", False)) else "false"),
+        ("transport_updated_at", q(n.get("transport_updated_at", ""))),
         ("provisioned", "true" if bool(n.get("provisioned", True)) else "false"),
     ]
     return "\n".join(f"{k} = {v}" for k, v in fields) + "\n"
@@ -575,7 +609,17 @@ class Manager:
                         "enabled": bool(n.get("enabled", True)), "priority": int(n["priority"]),
                         "public_ip": str(n.get("public_ip", "")), "health": False,
                         "awg": {"interface": str(n["awg_interface"]), "up": False, "handshake_age_sec": -1},
-                        "connectivity": {"tunnel": False, "tunnel_rtt_ms": None, "telegram": False},
+                        "transport": {
+                            "profile": str(n.get("transport_profile", "legacy")),
+                            "header_protection": bool(n.get("header_protection", False)),
+                            "mtu": int(n.get("transport_mtu", 0) or 0),
+                            "updated_at": str(n.get("transport_updated_at", "")) or None,
+                        },
+                        "connectivity": {
+                            "tunnel": False, "tunnel_rtt_ms": None, "telegram": False,
+                            "telegram_target": None, "telegram_ip": None,
+                            "telegram_probes_tried": 0, "telegram_probe_total": len(TELEGRAM_PROBES),
+                        },
                         "error": type(exc).__name__,
                     }
                 node_id = str(n["id"])
@@ -940,7 +984,8 @@ def probe_only() -> int:
     print("EgressMT — probe")
     print("================")
     for r in rows:
-        print(f"{r['priority']:>3} {r['name']} [{r['id']}] {'HEALTHY' if r['health'] else 'DOWN'} hs={r['awg']['handshake_age_sec']}s rtt={r['connectivity']['tunnel_rtt_ms']}ms TG={'OK' if r['connectivity']['telegram'] else 'FAIL'}")
+        target = r.get("connectivity", {}).get("telegram_target") or "—"
+        print(f"{r['priority']:>3} {r['name']} [{r['id']}] {'HEALTHY' if r['health'] else 'DOWN'} hs={r['awg']['handshake_age_sec']}s rtt={r['connectivity']['tunnel_rtt_ms']}ms TG={'OK' if r['connectivity']['telegram'] else 'FAIL'} target={target}")
     enabled = [r for r in rows if r.get("enabled")]
     return 0 if not enabled or all(r["health"] for r in enabled) else 2
 

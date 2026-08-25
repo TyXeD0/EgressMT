@@ -27,15 +27,13 @@ apt-get -o DPkg::Lock::Timeout=120 install -y \
     openssh-client sshpass dkms "linux-headers-$(uname -r)" >/dev/null
 
 install_amneziawg(){
-    command -v awg >/dev/null 2>&1 && command -v awg-quick >/dev/null 2>&1 && return 0
-
     local fpr="75C9DD72C799870E310542E24166F2C257290828"
     local keyring="/usr/share/keyrings/amnezia-archive-keyring.gpg"
     local source="/etc/apt/sources.list.d/amnezia-ppa.sources"
     local armored="$TMP/amnezia-ppa.asc"
     local got=""
 
-    msg "Устанавливаю AmneziaWG..." "Installing AmneziaWG..."
+    msg "Устанавливаю или обновляю AmneziaWG..." "Installing or updating AmneziaWG..."
     curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 \
         "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${fpr}" \
         -o "$armored" || fail "cannot download Amnezia PPA signing key"
