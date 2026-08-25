@@ -101,7 +101,39 @@ export DEBIAN_FRONTEND=noninteractive
   exit 78
 }
 
+normalize_amnezia_sources() {
+  local needle="ppa.launchpadcontent.net/amnezia/ppa/ubuntu" src
+  for src in /etc/apt/sources.list.d/*; do
+    [[ -f "$src" ]] || continue
+    grep -Fqs "$needle" "$src" || continue
+    if [[ "$src" == *.sources ]]; then
+      python3 - "$src" "$needle" <<'PY2'
+from pathlib import Path
+import re,sys
+p=Path(sys.argv[1]); needle=sys.argv[2]
+text=p.read_text(encoding='utf-8',errors='replace')
+stanzas=[x for x in re.split(r'
+[ 	]*
+',text.strip()) if x.strip()]
+keep=[x for x in stanzas if needle not in x]
+if keep: p.write_text('
+
+'.join(keep)+'
+',encoding='utf-8')
+else: p.unlink()
+PY2
+    else
+      sed -i "\|$needle|d" "$src"
+      [[ -s "$src" ]] || rm -f "$src"
+    fi
+  done
+  if [[ -f /etc/apt/sources.list ]] && grep -Fqs "$needle" /etc/apt/sources.list; then
+    sed -i "\|$needle|d" /etc/apt/sources.list
+  fi
+}
+
 APT=(apt-get -o DPkg::Lock::Timeout=120)
+normalize_amnezia_sources
 "${APT[@]}" update -y >/dev/null
 "${APT[@]}" install -y \
   ca-certificates curl gnupg iproute2 nftables python3 dkms \
@@ -113,18 +145,23 @@ FPR="75C9DD72C799870E310542E24166F2C257290828"
   KEY="$(mktemp /tmp/egressmt-amnezia-key.XXXXXX)"
   trap 'rm -f "$KEY"' EXIT
 
-  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 \
-    "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${FPR}" \
-    -o "$KEY"
-
-  GOT="$(gpg --batch --show-keys --with-colons "$KEY" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
-  [[ "$GOT" == "$FPR" ]] || {
-    echo "Amnezia PPA signing-key fingerprint mismatch" >&2
-    exit 74
-  }
-
-  install -d -m 755 /usr/share/keyrings
-  gpg --batch --yes --dearmor --output "$KEYRING" "$KEY"
+  normalize_amnezia_sources
+  GOT=""
+  if [[ -f "$KEYRING" ]]; then
+    GOT="$(gpg --batch --show-keys --with-colons "$KEYRING" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+  fi
+  if [[ "$GOT" != "$FPR" ]]; then
+    curl -fsSL --retry 7 --retry-delay 3 --retry-all-errors --connect-timeout 10 \
+      "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${FPR}" \
+      -o "$KEY"
+    GOT="$(gpg --batch --show-keys --with-colons "$KEY" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+    [[ "$GOT" == "$FPR" ]] || {
+      echo "Amnezia PPA signing-key fingerprint mismatch" >&2
+      exit 74
+    }
+    install -d -m 755 /usr/share/keyrings
+    gpg --batch --yes --dearmor --output "$KEYRING" "$KEY"
+  fi
   chmod 644 "$KEYRING"
 
   cat >"$SOURCE" <<EOF

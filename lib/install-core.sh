@@ -19,8 +19,48 @@ if [[ -r /etc/os-release ]]; then
     [[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] || fail "Ubuntu 24.04 is required for v0.1.0-rc1"
 fi
 
+normalize_amnezia_sources(){
+    local needle="ppa.launchpadcontent.net/amnezia/ppa/ubuntu"
+    local backup="/var/lib/egressmt/apt-source-backups/$(date +%Y%m%d-%H%M%S)"
+    local changed=0 src
+    for src in /etc/apt/sources.list.d/*; do
+        [[ -f "$src" ]] || continue
+        grep -Fqs "$needle" "$src" || continue
+        (( changed == 1 )) || { install -d -m 700 "$backup"; changed=1; }
+        cp -a "$src" "$backup/$(basename "$src")"
+        if [[ "$src" == *.sources ]]; then
+            python3 - "$src" "$needle" <<'PY2'
+from pathlib import Path
+import re,sys
+p=Path(sys.argv[1]); needle=sys.argv[2]
+text=p.read_text(encoding='utf-8',errors='replace')
+stanzas=[x for x in re.split(r'
+[ 	]*
+',text.strip()) if x.strip()]
+keep=[x for x in stanzas if needle not in x]
+if keep:
+    p.write_text('
+
+'.join(keep)+'
+',encoding='utf-8')
+else:
+    p.unlink()
+PY2
+        else
+            sed -i "\|$needle|d" "$src"
+            [[ -s "$src" ]] || rm -f "$src"
+        fi
+    done
+    if [[ -f /etc/apt/sources.list ]] && grep -Fqs "$needle" /etc/apt/sources.list; then
+        (( changed == 1 )) || { install -d -m 700 "$backup"; changed=1; }
+        cp -a /etc/apt/sources.list "$backup/sources.list"
+        sed -i "\|$needle|d" /etc/apt/sources.list
+    fi
+}
+
 msg "Проверка зависимостей..." "Checking dependencies..."
 export DEBIAN_FRONTEND=noninteractive
+normalize_amnezia_sources
 apt-get -o DPkg::Lock::Timeout=120 update -y >/dev/null
 apt-get -o DPkg::Lock::Timeout=120 install -y \
     ca-certificates curl gnupg python3 iproute2 iputils-ping nftables \
@@ -34,15 +74,20 @@ install_amneziawg(){
     local got=""
 
     msg "Устанавливаю или обновляю AmneziaWG..." "Installing or updating AmneziaWG..."
-    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 \
-        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${fpr}" \
-        -o "$armored" || fail "cannot download Amnezia PPA signing key"
-
-    got="$(gpg --batch --show-keys --with-colons "$armored" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
-    [[ "$got" == "$fpr" ]] || fail "Amnezia PPA signing-key fingerprint mismatch"
-
-    install -d -m 755 /usr/share/keyrings
-    gpg --batch --yes --dearmor --output "$keyring" "$armored"
+    normalize_amnezia_sources
+    if [[ -f "$keyring" ]]; then
+        got="$(gpg --batch --show-keys --with-colons "$keyring" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+    fi
+    if [[ "$got" != "$fpr" ]]; then
+        rm -f "$armored"
+        curl -fsSL --retry 7 --retry-delay 3 --retry-all-errors --connect-timeout 10 \
+            "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${fpr}" \
+            -o "$armored" || fail "cannot download Amnezia PPA signing key"
+        got="$(gpg --batch --show-keys --with-colons "$armored" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+        [[ "$got" == "$fpr" ]] || fail "Amnezia PPA signing-key fingerprint mismatch"
+        install -d -m 755 /usr/share/keyrings
+        gpg --batch --yes --dearmor --output "$keyring" "$armored"
+    fi
     chmod 644 "$keyring"
 
     cat >"$source" <<EOF
